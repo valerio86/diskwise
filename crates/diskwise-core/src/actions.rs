@@ -99,24 +99,193 @@ impl Snapshot {
     }
 }
 
-/// Why diskwise refuses to move `path` to the Trash at all, if it does.
-pub fn protected_reason(path: &str, platform: &Platform) -> Option<String> {
-    let depth = path.split('/').filter(|s| !s.is_empty()).count();
-    let parent = Path::new(path)
-        .parent()
-        .and_then(|p| p.to_str())
-        .unwrap_or("");
-    if depth <= 1 {
-        Some(format!(
-            "{path} is a top-level system folder. diskwise won't move it to the Trash."
-        ))
-    } else if parent == platform.home_base {
-        Some(format!(
-            "{path} is a home folder. diskwise won't move it to the Trash."
-        ))
-    } else {
-        None
+/// Folders that belong to the operating system or a package manager. They, and
+/// everything inside them, are never moved to the Trash: clearing anything there
+/// goes through the owning tool (suggestions say how).
+const MACOS_SYSTEM: &[&str] = &[
+    "/System",
+    "/Library",
+    "/private",
+    "/usr",
+    "/bin",
+    "/sbin",
+    "/cores",
+    "/opt/homebrew",
+];
+const LINUX_SYSTEM: &[&str] = &[
+    "/usr",
+    "/etc",
+    "/bin",
+    "/sbin",
+    "/lib",
+    "/lib32",
+    "/lib64",
+    "/libx32",
+    "/boot",
+    "/proc",
+    "/sys",
+    "/dev",
+    "/run",
+    "/snap",
+    "/var/lib",
+    "/var/db",
+    "/var/spool",
+];
+
+/// Which paths diskwise refuses to move to the Trash, however they're selected.
+#[derive(Debug, Clone)]
+pub struct Protection {
+    /// Folders that contain home folders: /Users, /home, and where those really
+    /// are (Fedora Silverblue: /home → /var/home).
+    home_bases: Vec<String>,
+    /// Home folders themselves, wherever they live ($HOME, the user database).
+    homes: Vec<String>,
+    system: &'static [&'static str],
+}
+
+impl Protection {
+    /// Protection for `platform`. On this machine's own platform it also reads
+    /// $HOME and /etc/passwd, so relocated home folders are protected too.
+    pub fn for_platform(platform: &Platform) -> Self {
+        let mut p = Self::new(platform, Vec::new());
+        if platform == crate::platform::CURRENT {
+            if let Some(base) = canonical(platform.home_base) {
+                p.home_bases.push(base);
+            }
+            let mut homes: Vec<String> = std::env::var("HOME").ok().into_iter().collect();
+            if let Ok(passwd) = std::fs::read_to_string("/etc/passwd") {
+                homes.extend(passwd_homes(&passwd));
+            }
+            for h in homes {
+                p.homes.push(h.trim_end_matches('/').to_string());
+                p.homes.extend(canonical(&h));
+            }
+            p.homes.sort();
+            p.homes.dedup();
+            p.home_bases.dedup();
+        }
+        p
     }
+
+    /// Protection from explicit facts (tests, or another machine's snapshot).
+    pub fn new(platform: &Platform, homes: Vec<String>) -> Self {
+        Protection {
+            home_bases: vec![platform.home_base.to_string()],
+            homes,
+            system: if platform.os == "macos" {
+                MACOS_SYSTEM
+            } else {
+                LINUX_SYSTEM
+            },
+        }
+    }
+
+    /// Why `path` (a display path) must never be moved to the Trash, if it mustn't.
+    pub fn reason(&self, path: &str) -> Option<String> {
+        let path = path.trim_end_matches('/');
+        let depth = path.split('/').filter(|s| !s.is_empty()).count();
+        let parent = Path::new(path)
+            .parent()
+            .and_then(|p| p.to_str())
+            .unwrap_or("");
+        if depth <= 1 {
+            Some(format!(
+                "{path} is a top-level system folder. diskwise won't move it to the Trash."
+            ))
+        } else if self.homes.iter().any(|h| h == path)
+            || self.home_bases.iter().any(|b| b == parent)
+        {
+            Some(format!(
+                "{path} is a home folder. diskwise won't move it to the Trash."
+            ))
+        } else {
+            self.system.iter().find(|s| path == **s || inside(path, s)).map(|sys| {
+                format!(
+                    "{path} is part of the operating system or a package manager ({sys}). diskwise won't move it to the Trash: removing files there can break your system."
+                )
+            })
+        }
+    }
+
+    /// Whether `path` is inside someone's home folder (where users keep their own files).
+    pub fn in_home(&self, path: &str) -> bool {
+        self.homes.iter().any(|h| inside(path, h))
+            || self
+                .home_bases
+                .iter()
+                .any(|b| inside(path, b) && path[b.len()..].trim_start_matches('/').contains('/'))
+    }
+}
+
+fn inside(path: &str, dir: &str) -> bool {
+    path.strip_prefix(dir)
+        .is_some_and(|rest| rest.starts_with('/'))
+}
+
+fn canonical(path: &str) -> Option<String> {
+    let c = std::fs::canonicalize(path).ok()?.display().to_string();
+    (c != path.trim_end_matches('/')).then_some(c)
+}
+
+/// Home directories from /etc/passwd (field 6), skipping "/" and empty ones.
+fn passwd_homes(passwd: &str) -> Vec<String> {
+    passwd
+        .lines()
+        .filter(|l| !l.starts_with('#'))
+        .filter_map(|l| l.split(':').nth(5))
+        .filter(|h| h.len() > 1)
+        .map(String::from)
+        .collect()
+}
+
+/// Every reason not to move `display` to the Trash right now, checked in one
+/// place for the TUI and the desktop app alike: the item must be in the scan
+/// (and not the scan root itself), not protected, named exactly, and still
+/// there on disk looking like what was scanned.
+pub fn check_trash(snap: &Snapshot, display: &str, protection: &Protection) -> Result<(), String> {
+    let Some(idx) = snap.locate(display) else {
+        return Err(format!("{display} isn't in the scan."));
+    };
+    if idx.is_empty() {
+        return Err(format!(
+            "{display} is the folder that was scanned. diskwise only moves things inside it."
+        ));
+    }
+    if let Some(reason) = protection.reason(display) {
+        return Err(reason);
+    }
+    let mut node = &snap.tree;
+    for &i in &idx {
+        node = &node.children[i];
+        if node.lossy_name {
+            return Err(format!(
+                "\"{}\" has characters in its name that diskwise can't represent exactly, so it can't act on it safely. Use Finder or a terminal instead.",
+                node.name
+            ));
+        }
+    }
+    if snap.platform() != crate::platform::CURRENT {
+        return Err("This scan came from another operating system, so its paths don't refer to this machine.".into());
+    }
+    let real = snap.real_path(display);
+    let meta = std::fs::symlink_metadata(&real).map_err(|_| {
+        format!("{display} isn't there any more. Scan again to see the current state.")
+    })?;
+    let kind_now = if meta.file_type().is_symlink() {
+        NodeKind::Link
+    } else if meta.is_dir() {
+        NodeKind::Dir
+    } else {
+        NodeKind::File
+    };
+    let changed =
+        kind_now != node.kind || (node.kind == NodeKind::File && meta.len() != node.logical);
+    if changed {
+        return Err(format!(
+            "{display} has changed since the scan. Scan again before moving it to the Trash."
+        ));
+    }
+    Ok(())
 }
 
 /// Move one path to the system Trash, then check it's really gone from where it
@@ -243,10 +412,92 @@ mod tests {
 
     #[test]
     fn protection() {
-        assert!(protected_reason("/usr", &LINUX).is_some());
-        assert!(protected_reason("/home/v", &LINUX).is_some());
-        assert!(protected_reason("/Users/v", &MACOS).is_some());
-        assert!(protected_reason("/Users/v/Library/Caches/x", &MACOS).is_none());
+        let mac = Protection::new(&MACOS, vec![]);
+        assert!(mac.reason("/Users/v").is_some(), "home folder");
+        assert!(mac.reason("/Users/v/Library/Caches/x").is_none());
+        // System and package-manager trees, at any depth.
+        assert!(mac.reason("/opt/homebrew").is_some());
+        assert!(mac.reason("/opt/homebrew/Cellar/x").is_some());
+        assert!(mac.reason("/private/var").is_some());
+        assert!(mac.reason("/Applications/Some.app").is_none());
+        let linux = Protection::new(&LINUX, vec![]);
+        assert!(linux.reason("/usr").is_some() && linux.reason("/usr/lib/x").is_some());
+        assert!(linux.reason("/var/lib/docker").is_some());
+        assert!(linux.reason("/home/v").is_some());
+        assert!(linux.reason("/home/v/proj").is_none());
+        assert!(linux.reason("/srv/share/old").is_none());
+    }
+
+    #[test]
+    fn relocated_homes_are_protected() {
+        // Fedora Silverblue: /home is a link to /var/home, so scanned paths are /var/home/….
+        let mut p = Protection::new(&LINUX, vec!["/var/home/v".into()]);
+        p.home_bases.push("/var/home".into());
+        assert!(p.reason("/var/home/v").is_some());
+        assert!(
+            p.reason("/var/home/other").is_some(),
+            "any folder directly in a home base"
+        );
+        assert!(p.reason("/var/home/v/proj").is_none());
+        assert!(p.in_home("/var/home/v/proj"));
+        assert!(!p.in_home("/srv/share"));
+        assert_eq!(
+            passwd_homes(
+                "root:x:0:0::/root:/bin/sh\nv:x:1000:1000::/var/home/v:/bin/bash\nnobody:x:65534:65534::/:/usr/sbin/nologin\n"
+            ),
+            vec!["/root", "/var/home/v"]
+        );
+    }
+
+    #[test]
+    fn check_trash_refusals() {
+        // Not the system temp dir: on macOS that's under /private, which is protected.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/test-tmp")
+            .join(format!("check-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("a/b")).unwrap();
+        std::fs::write(root.join("a/g"), vec![0u8; 50]).unwrap();
+        let r = std::fs::canonicalize(&root).unwrap().display().to_string();
+        let mut s = snap(&r, crate::platform::CURRENT.os);
+        s.tree.children[0].children[1].logical = 50; // a/g as scanned
+        let p = Protection::new(crate::platform::CURRENT, vec![]);
+
+        assert!(
+            check_trash(&s, &r, &p).unwrap_err().contains("was scanned"),
+            "the root"
+        );
+        assert!(check_trash(&s, &format!("{r}/a/b"), &p).is_ok());
+        assert!(check_trash(&s, &format!("{r}/a/g"), &p).is_ok());
+        // Changed since the scan: a file of a different size.
+        std::fs::write(root.join("a/g"), vec![0u8; 80]).unwrap();
+        assert!(
+            check_trash(&s, &format!("{r}/a/g"), &p)
+                .unwrap_err()
+                .contains("changed")
+        );
+        // Gone since the scan.
+        std::fs::remove_dir(root.join("a/b")).unwrap();
+        assert!(
+            check_trash(&s, &format!("{r}/a/b"), &p)
+                .unwrap_err()
+                .contains("isn't there")
+        );
+        // A name stored lossily (not valid UTF-8 on disk).
+        s.tree.children[0].children[0].lossy_name = true;
+        assert!(
+            check_trash(&s, &format!("{r}/a/b"), &p)
+                .unwrap_err()
+                .contains("characters")
+        );
+        // A snapshot from the other OS.
+        s.os = if s.os == "macos" {
+            "linux".into()
+        } else {
+            "macos".into()
+        };
+        assert!(check_trash(&s, &format!("{r}/a/g"), &p).is_err());
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

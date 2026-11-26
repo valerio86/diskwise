@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 
-use diskwise_core::actions::{move_to_trash, protected_reason};
+use diskwise_core::actions::{Protection, check_trash, move_to_trash};
 use diskwise_core::rules::{Action, Category, Safety};
 use diskwise_core::{Finding, NodeKind, RuleSet, Snapshot, analyze, human_bytes};
 use serde::Serialize;
@@ -13,6 +13,10 @@ pub struct Session {
     pub snap: Snapshot,
     rules: RuleSet,
     now: i64,
+    /// Scanned in this run. A snapshot loaded from a file may be stale or from
+    /// another machine, so nothing is moved to the Trash until a fresh scan.
+    pub live: bool,
+    protection: Protection,
     findings: Vec<Finding>,
     /// Display path → index into `findings`, for every finding item.
     claimed: HashMap<String, usize>,
@@ -38,7 +42,9 @@ pub struct Tile {
     pub changed: i64,
     pub target: Option<String>,
     /// The suggestion covering this tile, directly or through a parent.
-    pub finding: Option<usize>,
+    /// Id of the covering suggestion. An id, not a position: positions shift
+    /// whenever suggestions re-sort (e.g. after a trash).
+    pub finding: Option<String>,
     pub safety: Option<Safety>,
     pub direct: bool,
     /// Safe/caution bytes inside (folders only).
@@ -110,6 +116,8 @@ pub struct Disk {
 #[derive(Serialize)]
 pub struct Summary {
     pub root: String,
+    /// False for a saved snapshot: nothing can be moved to the Trash from it.
+    pub live: bool,
     pub os: String,
     pub scanned_at: i64,
     pub disk: Option<Disk>,
@@ -151,11 +159,14 @@ pub struct TrashResult {
 }
 
 impl Session {
-    pub fn new(snap: Snapshot, rules: RuleSet, now: i64) -> Self {
+    pub fn new(snap: Snapshot, rules: RuleSet, now: i64, live: bool) -> Self {
+        let protection = Protection::for_platform(snap.platform());
         let mut s = Session {
             snap,
             rules,
             now,
+            live,
+            protection,
             findings: Vec::new(),
             claimed: HashMap::new(),
             cleanable_below: HashMap::new(),
@@ -209,6 +220,7 @@ impl Session {
         });
         Summary {
             root: self.snap.display_root(),
+            live: self.live,
             os: self.snap.platform().os.to_string(),
             scanned_at: self.snap.scanned_at,
             disk,
@@ -289,7 +301,7 @@ impl Session {
                     dirs: c.dirs,
                     changed: c.newest_mtime,
                     target: c.target.clone(),
-                    finding: cov.map(|(i, _)| i),
+                    finding: cov.map(|(i, _)| self.findings[i].id.clone()),
                     safety: cov.map(|(i, _)| self.findings[i].safety),
                     direct: cov.is_some_and(|(_, d)| d),
                     cleanable: child_path
@@ -336,14 +348,24 @@ impl Session {
         })
     }
 
+    fn saved_snapshot_refusal() -> Plan {
+        refuse(
+            "Scan again first",
+            "This is a saved scan. It may be out of date or from another machine, so diskwise won't move anything to the Trash from it. Click Scan again, then try once more.".into(),
+        )
+    }
+
     /// Plan trashing one path the user picked on the map.
     pub fn plan_path(&self, path: &str) -> Plan {
+        if !self.live {
+            return Self::saved_snapshot_refusal();
+        }
+        if let Err(reason) = check_trash(&self.snap, path, &self.protection) {
+            return refuse("Can't move this to the Trash", reason);
+        }
         let Some(node) = self.snap.node(path) else {
             return refuse("Not found", format!("{path} isn't in the scan any more."));
         };
-        if let Some(reason) = protected_reason(path, self.snap.platform()) {
-            return refuse("Protected folder", reason);
-        }
         let target = vec![TrashTarget {
             path: path.to_string(),
             bytes: node.allocated,
@@ -365,39 +387,50 @@ impl Session {
                 }
                 confirm(target, warning_for(f, direct))
             }
-            None => confirm(
+            None if self.protection.in_home(path) => confirm(
                 target,
                 Some("No suggestion covers this item. Make sure you don't need it.".into()),
+            ),
+            None => confirm(
+                target,
+                Some("This is outside your home folder and no suggestion covers it. Apps and system tools may depend on it: only continue if you know what it is.".into()),
             ),
         }
     }
 
-    /// Plan trashing every item of a suggestion.
-    pub fn plan_finding(&self, index: usize) -> Plan {
-        let Some(f) = self.findings.get(index) else {
+    /// Plan trashing every item of a suggestion, named by its id.
+    pub fn plan_finding(&self, id: &str) -> Plan {
+        let Some(f) = self.findings.iter().find(|f| f.id == id) else {
             return refuse("Not found", "That suggestion no longer exists.".into());
         };
         if !matches!(f.action, Action::Trash | Action::Archive) || f.items.is_empty() {
             return refusal(f);
         }
-        let platform = self.snap.platform();
-        let (allowed, protected): (Vec<_>, Vec<_>) = f
+        if !self.live {
+            return Self::saved_snapshot_refusal();
+        }
+        let (allowed, refused): (Vec<_>, Vec<_>) = f
             .items
             .iter()
-            .partition(|i| protected_reason(&i.path, platform).is_none());
+            .map(|i| (i, check_trash(&self.snap, &i.path, &self.protection)))
+            .partition(|(_, r)| r.is_ok());
         if allowed.is_empty() {
+            let why = refused
+                .first()
+                .and_then(|(_, r)| r.clone().err())
+                .unwrap_or_default();
             return refuse(
                 "Nothing to move",
-                "Every item in this suggestion is a top-level or home folder, which diskwise won't move to the Trash.".into(),
+                format!("diskwise can't move any of these items. {why}"),
             );
         }
         let mut warning = warning_for(f, true);
-        if !protected.is_empty() {
+        if !refused.is_empty() {
             let note = format!(
-                "Left out (protected folders): {}.",
-                protected
+                "Left out: {}.",
+                refused
                     .iter()
-                    .map(|i| i.path.as_str())
+                    .map(|(i, _)| i.path.as_str())
                     .collect::<Vec<_>>()
                     .join(", ")
             );
@@ -409,7 +442,7 @@ impl Session {
         confirm(
             allowed
                 .into_iter()
-                .map(|i| TrashTarget {
+                .map(|(i, _)| TrashTarget {
                     path: i.path.clone(),
                     bytes: i.bytes,
                 })
@@ -425,20 +458,21 @@ impl Session {
         paths: &[String],
         trasher: impl Fn(&std::path::Path) -> Result<(), String>,
     ) -> TrashResult {
-        let platform = self.snap.platform();
         let mut moved = 0;
         let mut bytes = 0;
         let mut failures = Vec::new();
         for p in paths {
-            // Re-check here: the UI only sends what a plan allowed, but don't rely on it.
-            if let Some(reason) = protected_reason(p, platform) {
+            // Re-check everything here: the UI only sends what a plan allowed, but
+            // the disk may have changed since, and the UI isn't trusted anyway.
+            if !self.live {
+                failures.push(format!("{p}: this is a saved scan; scan again first"));
+                continue;
+            }
+            if let Err(reason) = check_trash(&self.snap, p, &self.protection) {
                 failures.push(reason);
                 continue;
             }
-            let Some(size) = self.snap.node(p).map(|n| n.allocated) else {
-                failures.push(format!("{p}: not in the scan"));
-                continue;
-            };
+            let size = self.snap.node(p).map(|n| n.allocated).unwrap_or(0);
             let real = self.snap.real_path(p);
             match trasher(std::path::Path::new(&real)) {
                 Ok(()) => {
@@ -646,7 +680,13 @@ mod tests {
             skipped_mounts: vec![],
             system: None,
         };
-        Session::new(snap, RuleSet::builtin_for(&LINUX).unwrap(), 1_800_000_000)
+        // A snapshot from another OS: fine for viewing, never live.
+        Session::new(
+            snap,
+            RuleSet::builtin_for(&LINUX).unwrap(),
+            1_800_000_000,
+            false,
+        )
     }
 
     #[test]
@@ -672,77 +712,159 @@ mod tests {
         assert!(docs.finding.is_none() && docs.cleanable == 0);
     }
 
+    /// A live session over a real folder tree on disk: plans and trashing check
+    /// the disk, so they can't be tested on made-up paths. Rules point at it.
+    fn live_session(tag: &str) -> (Session, String, std::path::PathBuf) {
+        // Under target/ (inside the user's home, not /tmp: macOS's temp dir is in
+        // /private, which is protected).
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/test-tmp")
+            .join(format!("app-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for d in ["v/.cache/pip", "v/proj/.venv", "v/docs"] {
+            std::fs::create_dir_all(dir.join(d)).unwrap();
+        }
+        let r = std::fs::canonicalize(&dir).unwrap().display().to_string();
+        let tree = n(
+            &r,
+            NodeKind::Dir,
+            0,
+            vec![n(
+                "v",
+                NodeKind::Dir,
+                0,
+                vec![
+                    n(
+                        ".cache",
+                        NodeKind::Dir,
+                        0,
+                        vec![n("pip", NodeKind::Dir, 300 << 20, vec![])],
+                    ),
+                    n(
+                        "proj",
+                        NodeKind::Dir,
+                        0,
+                        vec![n(".venv", NodeKind::Dir, 200 << 20, vec![])],
+                    ),
+                    n("docs", NodeKind::Dir, 100 << 20, vec![]),
+                ],
+            )],
+        );
+        let snap = Snapshot {
+            version: SNAPSHOT_VERSION,
+            os: diskwise_core::platform::CURRENT.os.into(),
+            root: r.clone(),
+            scanned_at: 0,
+            duration_ms: 0,
+            min_node_size: 0,
+            tree,
+            errors: ErrorSummary::default(),
+            skipped_mounts: vec![],
+            system: None,
+        };
+        let rules = format!(
+            r#"
+            [[rule]]
+            id = "pip"
+            title = "pip cache"
+            match = ["{r}/v/.cache/pip"]
+            category = "cache"
+            safety = "safe"
+            action = "trash"
+            why = ""
+            how = ""
+            [[rule]]
+            id = "venv"
+            title = "venv"
+            match = ["{r}/v/proj/.venv"]
+            category = "developer"
+            safety = "caution"
+            action = "trash"
+            why = ""
+            how = "Quit first."
+            "#
+        );
+        let platform = diskwise_core::platform::CURRENT;
+        let rules = RuleSet::from_sources(platform, &[("test", rules.as_str())]).unwrap();
+        (Session::new(snap, rules, 1_800_000_000, true), r, dir)
+    }
+
     #[test]
     fn plans_refuse_and_warn() {
-        let s = session("/");
-        assert!(
-            matches!(s.plan_path("/home/v"), Plan::Refuse { .. }),
-            "home folder"
-        );
+        let (s, r, dir) = live_session("plans");
+        let refused = |p: &str| matches!(s.plan_path(p), Plan::Refuse { .. });
+        let warns = |p: &str| {
+            matches!(
+                s.plan_path(p),
+                Plan::Confirm {
+                    warning: Some(_),
+                    ..
+                }
+            )
+        };
+        assert!(refused(&r), "the scanned folder itself");
+        assert!(refused("/usr"), "system folder");
         assert!(
             matches!(
-                s.plan_path("/home/v/.cache/pip"),
+                s.plan_path(&format!("{r}/v/.cache/pip")),
                 Plan::Confirm { warning: None, .. }
             ),
             "safe"
         );
-        assert!(
-            matches!(
-                s.plan_path("/home/v/proj/.venv"),
-                Plan::Confirm {
-                    warning: Some(_),
-                    ..
-                }
-            ),
-            "caution"
-        );
-        assert!(
-            matches!(
-                s.plan_path("/home/v/docs"),
-                Plan::Confirm {
-                    warning: Some(_),
-                    ..
-                }
-            ),
-            "uncovered"
-        );
+        assert!(warns(&format!("{r}/v/proj/.venv")), "caution");
+        assert!(warns(&format!("{r}/v/docs")), "uncovered");
+        // Gone from disk since the scan: refused, not trashed blindly.
+        std::fs::remove_dir(dir.join("v/docs")).unwrap();
+        assert!(refused(&format!("{r}/v/docs")));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn saved_snapshots_never_trash() {
+        let (mut s, r, dir) = live_session("saved");
+        s.live = false;
+        let pip = format!("{r}/v/.cache/pip");
+        assert!(matches!(s.plan_path(&pip), Plan::Refuse { .. }));
+        assert!(matches!(s.plan_finding("pip"), Plan::Refuse { .. }));
+        let res = s.trash(&[pip], |_| Ok(()));
+        assert_eq!(res.moved, 0);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn trash_updates_tree_and_suggestions() {
-        let mut s = session("/");
-        let before = s.summary();
-        let pip = before
-            .findings
-            .iter()
-            .find(|f| f.id == "package-manager-caches")
-            .unwrap();
-        assert_eq!(pip.common_parent.as_deref(), Some("/home/v/.cache"));
-        // A trasher that claims success but leaves the file: nothing changes.
-        let r = s.trash(&["/home/v/.cache/pip".into()], |_| {
+        let (mut s, r, dir) = live_session("trash");
+        let pip = format!("{r}/v/.cache/pip");
+        assert_eq!(
+            s.summary()
+                .findings
+                .iter()
+                .find(|f| f.id == "pip")
+                .unwrap()
+                .common_parent
+                .as_deref(),
+            Some(format!("{r}/v/.cache").as_str())
+        );
+        // A trash that fails changes nothing.
+        let res = s.trash(std::slice::from_ref(&pip), |_| {
             Err("still there after moving to Trash".into())
         });
-        assert_eq!(r.moved, 0);
-        assert!(
-            s.summary()
-                .findings
-                .iter()
-                .any(|f| f.id == "package-manager-caches")
-        );
+        assert_eq!(res.moved, 0);
+        assert!(s.summary().findings.iter().any(|f| f.id == "pip"));
         // A real move: the tree shrinks and the suggestion disappears.
-        let r = s.trash(&["/home/v/.cache/pip".into()], |_| Ok(()));
-        assert_eq!((r.moved, r.bytes), (1, 300 << 20));
+        let res = s.trash(&[pip], |p| {
+            std::fs::remove_dir_all(p).map_err(|e| e.to_string())
+        });
+        assert_eq!((res.moved, res.bytes), (1, 300 << 20));
         assert_eq!(s.snap.tree.allocated, 300 << 20);
-        assert!(
-            s.summary()
-                .findings
-                .iter()
-                .all(|f| f.id != "package-manager-caches")
-        );
-        // Protected paths are refused even if the UI sent them.
-        let r = s.trash(&["/home/v".into()], |_| Ok(()));
-        assert_eq!(r.moved, 0);
-        assert_eq!(r.failures.len(), 1);
+        assert!(s.summary().findings.iter().all(|f| f.id != "pip"));
+        // Tiles name their suggestion by id, which survives re-sorting.
+        let v = s.view(Some(&format!("{r}/v/proj"))).unwrap();
+        assert_eq!(v.tiles[0].finding.as_deref(), Some("venv"));
+        // The scanned root and protected paths are refused even if the UI sends them.
+        let res = s.trash(&[r.clone(), "/usr".into()], |_| Ok(()));
+        assert_eq!((res.moved, res.failures.len()), (0, 2));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// Writes dev/fixture.js (git-ignored: it holds real paths) for the preview
@@ -753,7 +875,7 @@ mod tests {
         let file = std::env::var("DISKWISE_SNAPSHOT").expect("set DISKWISE_SNAPSHOT");
         let snap: Snapshot = serde_json::from_slice(&std::fs::read(file).unwrap()).unwrap();
         let rules = RuleSet::builtin_for(snap.platform()).unwrap();
-        let s = Session::new(snap, rules, 1_795_000_000);
+        let s = Session::new(snap, rules, 1_795_000_000, false);
         let summary = s.summary();
         // Every folder down to a few levels, plus each suggestion's folder.
         let mut paths = vec![s.snap.display_root()];

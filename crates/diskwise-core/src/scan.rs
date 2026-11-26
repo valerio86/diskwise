@@ -146,6 +146,8 @@ fn scan_dir(path: &Path, name: String, meta: &Metadata, ctx: &Ctx) -> Node {
             }
         };
         let child_name = entry.file_name().to_string_lossy().into_owned();
+        // Not valid UTF-8: `child_name` is an approximation, never to act on.
+        let lossy = entry.file_name().to_str().is_none();
 
         if child_meta.is_dir() {
             if ctx.opts.one_filesystem && child_meta.dev() != ctx.root_dev {
@@ -161,7 +163,7 @@ fn scan_dir(path: &Path, name: String, meta: &Metadata, ctx: &Ctx) -> Node {
                 }
                 continue;
             }
-            subdirs.push((child_path, child_name, child_meta));
+            subdirs.push((child_path, child_name, child_meta, lossy));
             continue;
         }
 
@@ -172,6 +174,7 @@ fn scan_dir(path: &Path, name: String, meta: &Metadata, ctx: &Ctx) -> Node {
             link.allocated = child_meta.blocks() * 512;
             link.files = 1;
             link.newest_mtime = child_meta.mtime();
+            link.lossy_name = lossy;
             link.target = fs::read_link(&child_path)
                 .ok()
                 .map(|t| t.display().to_string());
@@ -194,12 +197,17 @@ fn scan_dir(path: &Path, name: String, meta: &Metadata, ctx: &Ctx) -> Node {
             p.bytes.fetch_add(file.allocated, Ordering::Relaxed);
         }
         file.newest_mtime = child_meta.mtime();
+        file.lossy_name = lossy;
         place(&mut node, &mut rest, file, min);
     }
 
     let children: Vec<Node> = subdirs
         .into_par_iter()
-        .map(|(p, n, m)| scan_dir(&p, n, &m, ctx))
+        .map(|(p, n, m, lossy)| {
+            let mut d = scan_dir(&p, n, &m, ctx);
+            d.lossy_name = lossy;
+            d
+        })
         .collect();
     for child in children {
         node.dirs += 1 + child.dirs;
@@ -332,6 +340,31 @@ mod tests {
         .unwrap();
         assert!(out.skipped_mounts.is_empty());
         assert_eq!(out.tree.children[0].name, "sub");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn non_utf8_names_are_flagged() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tmpdir("lossy");
+        let name = std::ffi::OsStr::from_bytes(b"caf\xe9");
+        write(&dir.join(name), 2 * 1024 * 1024);
+        let tree = scan(
+            &dir,
+            ScanOptions {
+                min_node_size: 0,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .tree;
+        let n = tree
+            .children
+            .iter()
+            .find(|c| c.name.starts_with("caf"))
+            .unwrap();
+        assert!(n.lossy_name);
         fs::remove_dir_all(&dir).unwrap();
     }
 

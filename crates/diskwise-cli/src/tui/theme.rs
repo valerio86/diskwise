@@ -95,9 +95,10 @@ impl Theme {
                 rule: Color::Rgb(84, 84, 92),
                 selected_bg: Color::Rgb(52, 53, 66),
                 selected_fg: Color::Rgb(242, 242, 246),
-                safe: Color::Rgb(126, 204, 126),
-                caution: Color::Rgb(240, 200, 96),
-                review: Color::Rgb(214, 140, 214),
+                // The desktop app's set: validated for colour-vision deficiency.
+                safe: Color::Rgb(51, 140, 237),
+                caution: Color::Rgb(210, 142, 5),
+                review: Color::Rgb(226, 77, 139),
             },
             ColorMode::Indexed256 => Theme {
                 mode,
@@ -108,9 +109,11 @@ impl Theme {
                 rule: Color::Indexed(240),
                 selected_bg: Color::Indexed(237),
                 selected_fg: Color::Indexed(255),
-                safe: Color::Indexed(114),
-                caution: Color::Indexed(221),
-                review: Color::Indexed(176),
+                // Blue / amber / pink (#0087ff, #d78700, #d75f87): passes the
+                // colour-vision checks. Green next to amber didn't (protanopia).
+                safe: Color::Indexed(33),
+                caution: Color::Indexed(172),
+                review: Color::Indexed(168),
             },
             ColorMode::Basic16 => Theme {
                 mode,
@@ -121,7 +124,9 @@ impl Theme {
                 rule: Color::DarkGray,
                 selected_bg: Color::Blue,
                 selected_fg: Color::White,
-                safe: Color::Green,
+                // Exact shades depend on the terminal's theme; these three are the
+                // best-separated standard colours for colour-vision deficiency.
+                safe: Color::Cyan,
                 caution: Color::Yellow,
                 review: Color::Magenta,
             },

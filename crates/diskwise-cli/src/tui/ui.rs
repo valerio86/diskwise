@@ -835,25 +835,26 @@ mod tests {
 
     #[test]
     fn renders_browser_and_suggestions() {
-        let mut app = super::super::app::sample_app("/r");
-        app.reveal("/r/home/v/cache");
-        let screen = render(&app, 100, 24);
-        assert!(screen.contains("/r/home/v"), "{screen}");
+        let (mut app, r, dir) = super::super::app::disk_app("render");
+        app.reveal(&format!("{r}/home/v/cache"));
+        let screen = render(&app, 180, 30);
+        assert!(screen.contains(&format!("{r}/home/v")), "{screen}");
         assert!(
             screen.contains("cache/") && screen.contains("● cache"),
             "{screen}"
         );
         app.toggle_tab();
-        let screen = render(&app, 100, 24);
+        let screen = render(&app, 180, 30);
         assert!(
             screen.contains("Suggestions · 3") && screen.contains("safe"),
             "{screen}"
         );
         app.request_trash();
-        let screen = render(&app, 100, 24);
+        let screen = render(&app, 180, 30);
         assert!(
-            screen.contains("Move to Trash?") && screen.contains("/r/home/v/cache"),
+            screen.contains("Move to Trash?") && screen.contains(&format!("{r}/home/v/cache")),
             "{screen}"
         );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

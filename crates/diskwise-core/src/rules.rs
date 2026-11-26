@@ -181,10 +181,22 @@ impl RuleSet {
         }
         defs.sort_by_key(|d| d.fallback); // stable: keeps order within each tier
 
-        let glob = |p: &str| -> Result<Glob> {
-            Ok(GlobBuilder::new(&expand_home(p, platform.home_base))
-                .literal_separator(true)
-                .build()?)
+        // `~/` means every home folder under each home base: /home, and on this
+        // machine also where /home really is (Fedora Silverblue: /var/home).
+        let mut home_bases = vec![platform.home_base.to_string()];
+        if platform == crate::platform::CURRENT
+            && let Ok(real) = std::fs::canonicalize(platform.home_base)
+            && real.to_str() != Some(platform.home_base)
+        {
+            home_bases.push(real.display().to_string());
+        }
+        let globs = |p: &str| -> Result<Vec<Glob>> {
+            let mut expanded: Vec<String> = home_bases.iter().map(|b| expand_home(p, b)).collect();
+            expanded.dedup();
+            expanded
+                .iter()
+                .map(|e| Ok(GlobBuilder::new(e).literal_separator(true).build()?))
+                .collect()
         };
         let mut include = GlobSetBuilder::new();
         let mut owner = Vec::new();
@@ -192,12 +204,16 @@ impl RuleSet {
         for def in defs {
             let idx = rules.len();
             for p in &def.patterns {
-                include.add(glob(p).with_context(|| format!("rule {}: pattern {p:?}", def.id))?);
-                owner.push(idx);
+                for g in globs(p).with_context(|| format!("rule {}: pattern {p:?}", def.id))? {
+                    include.add(g);
+                    owner.push(idx);
+                }
             }
             let mut exclude = GlobSetBuilder::new();
             for p in &def.exclude {
-                exclude.add(glob(p).with_context(|| format!("rule {}: exclude {p:?}", def.id))?);
+                for g in globs(p).with_context(|| format!("rule {}: exclude {p:?}", def.id))? {
+                    exclude.add(g);
+                }
             }
             let min_size = match &def.min_size {
                 Some(s) => parse_size(s)
@@ -223,6 +239,19 @@ impl RuleSet {
 
     /// The highest-priority rule that claims `node` at absolute `path`, if any.
     pub fn rule_for(&self, path: &str, node: &Node, now: i64) -> Option<(usize, &Rule)> {
+        self.rule_for_at(path, path, node, now)
+    }
+
+    /// Like `rule_for`, but conditions that look at the disk (`sibling`, `from`)
+    /// use `fs_path`: on macOS a display path like /.adobeTemp/x isn't where the
+    /// file is (/System/Volumes/Data/.adobeTemp/x).
+    pub fn rule_for_at(
+        &self,
+        path: &str,
+        fs_path: &str,
+        node: &Node,
+        now: i64,
+    ) -> Option<(usize, &Rule)> {
         let mut candidates: Vec<usize> = self
             .include
             .matches(path)
@@ -234,12 +263,12 @@ impl RuleSet {
         candidates
             .into_iter()
             .map(|i| (i, &self.rules[i]))
-            .find(|(_, r)| r.accepts(path, node, now))
+            .find(|(_, r)| r.accepts(path, fs_path, node, now))
     }
 }
 
 impl Rule {
-    fn accepts(&self, path: &str, node: &Node, now: i64) -> bool {
+    fn accepts(&self, path: &str, fs_path: &str, node: &Node, now: i64) -> bool {
         let kind_ok = match self.def.kind {
             KindFilter::Any => true,
             KindFilter::Dir => node.kind == NodeKind::Dir,
@@ -253,11 +282,11 @@ impl Rule {
                 .older_than_days
                 .is_none_or(|d| now - node.newest_mtime >= i64::from(d) * DAY)
             && self.def.sibling.as_ref().is_none_or(|s| {
-                Path::new(path)
+                Path::new(fs_path)
                     .parent()
                     .is_some_and(|dir| dir.join(s).exists())
             })
-            && (self.def.from.is_empty() || self.downloaded_from_listed_domain(path))
+            && (self.def.from.is_empty() || self.downloaded_from_listed_domain(fs_path))
     }
 
     fn downloaded_from_listed_domain(&self, path: &str) -> bool {
@@ -582,6 +611,34 @@ mod tests {
                 p.os
             );
         }
+    }
+
+    #[test]
+    fn disk_conditions_use_the_real_path() {
+        let dir = std::env::temp_dir().join(format!("diskwise-fspath-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("proj/target")).unwrap();
+        std::fs::write(dir.join("proj/Cargo.toml"), "").unwrap();
+        let src = r#"
+            [[rule]]
+            id = "t"
+            title = "t"
+            match = ["/shown/proj/target"]
+            sibling = "Cargo.toml"
+            min_size = "0"
+            category = "developer"
+            safety = "safe"
+            action = "trash"
+            why = ""
+            how = ""
+        "#;
+        let rs = RuleSet::from_sources(&MACOS, &[("test", src)]).unwrap();
+        let n = node(NodeKind::Dir, 1, 0);
+        let real = dir.join("proj/target").display().to_string();
+        // The display path has no Cargo.toml next to it on disk; the real one does.
+        assert!(rs.rule_for("/shown/proj/target", &n, 0).is_none());
+        assert!(rs.rule_for_at("/shown/proj/target", &real, &n, 0).is_some());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

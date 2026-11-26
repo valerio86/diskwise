@@ -54,45 +54,53 @@ fn now() -> i64 {
         .unwrap_or(0)
 }
 
-fn open_session(snap: Snapshot) -> Result<Session, String> {
+/// `live`: scanned in this run (so the disk matches it and trashing is allowed),
+/// as opposed to loaded from a saved file.
+fn open_session(snap: Snapshot, live: bool) -> Result<Session, String> {
     let rules = RuleSet::builtin_for(snap.platform()).map_err(|e| format!("{e:#}"))?;
-    Ok(Session::new(snap, rules, now()))
+    Ok(Session::new(snap, rules, now(), live))
+}
+
+fn load_saved(file: &std::path::Path) -> Result<Snapshot, String> {
+    std::fs::read(file)
+        .map_err(|e| format!("Couldn't read {}: {e}", file.display()))
+        .and_then(|b| {
+            serde_json::from_slice::<Snapshot>(&b)
+                .map_err(|e| format!("{} isn't a diskwise snapshot: {e}", file.display()))
+        })
 }
 
 /// Start a scan (or load the saved snapshot) in the background. Progress arrives
 /// as `scan-progress` events and the end as one `scan-done` event.
 #[tauri::command]
-fn start_scan(app: AppHandle, state: State<'_, Arc<AppState>>, rescan: bool) -> Result<(), String> {
+async fn start_scan(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+    rescan: bool,
+) -> Result<(), String> {
     if state.scanning.swap(true, Ordering::SeqCst) {
         return Err("A scan is already running.".into());
     }
     let state = Arc::clone(&state);
     std::thread::spawn(move || {
-        let result = match (&state.source, rescan) {
-            (Source::Saved(file), false) => std::fs::read(file)
-                .map_err(|e| format!("Couldn't read {}: {e}", file.display()))
-                .and_then(|b| {
-                    serde_json::from_slice::<Snapshot>(&b)
-                        .map_err(|e| format!("{} isn't a diskwise snapshot: {e}", file.display()))
-                }),
-            (source, _) => {
-                let root = match source {
-                    Source::Scan(p) => p.clone(),
-                    // Rescanning a saved snapshot scans the folder it came from.
-                    Source::Saved(_) => state
-                        .session
-                        .lock()
-                        .unwrap()
-                        .as_ref()
-                        .map(|s| PathBuf::from(&s.snap.root))
-                        .unwrap_or_else(|| PathBuf::from(DEFAULT_ROOT)),
-                };
-                scan_with_progress(&app, &root)
+        // The folder an earlier scan or snapshot covered, if any.
+        let scanned_root = lock(&state.session)
+            .as_ref()
+            .map(|s| PathBuf::from(&s.snap.root));
+        let result = match (&state.source, rescan, scanned_root) {
+            // Rescanning a saved snapshot scans the folder it came from…
+            (Source::Saved(_), true, Some(root)) => {
+                scan_with_progress(&app, &root).and_then(|s| open_session(s, true))
+            }
+            // …but if the file never loaded, there's no folder: retry the file.
+            (Source::Saved(file), _, _) => load_saved(file).and_then(|s| open_session(s, false)),
+            (Source::Scan(root), _, _) => {
+                scan_with_progress(&app, root).and_then(|s| open_session(s, true))
             }
         };
-        let done = match result.and_then(open_session) {
+        let done = match result {
             Ok(session) => {
-                *state.session.lock().unwrap() = Some(session);
+                *lock(&state.session) = Some(session);
                 ScanDone::Ready
             }
             Err(message) => ScanDone::Failed { message },
@@ -132,41 +140,57 @@ fn scan_with_progress(app: &AppHandle, root: &std::path::Path) -> Result<Snapsho
         .map_err(|e| format!("Couldn't scan {}: {e}", root.display()))
 }
 
+/// Lock, recovering from a panic in an earlier command instead of failing every
+/// command after it (the session data is still consistent: each command either
+/// finishes its update or doesn't start it).
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 fn with_session<T>(state: &AppState, f: impl FnOnce(&mut Session) -> T) -> Result<T, String> {
-    let mut guard = state.session.lock().unwrap();
+    let mut guard = lock(&state.session);
     let session = guard.as_mut().ok_or("No scan yet.")?;
     Ok(f(session))
 }
 
+// Commands are async so Tauri runs them off the main thread: the window keeps
+// responding while they work.
+
 #[tauri::command]
-fn summary(state: State<'_, Arc<AppState>>) -> Result<Summary, String> {
+async fn summary(state: State<'_, Arc<AppState>>) -> Result<Summary, String> {
     with_session(&state, |s| s.summary())
 }
 
 #[tauri::command]
-fn view(state: State<'_, Arc<AppState>>, path: Option<String>) -> Result<View, String> {
+async fn view(state: State<'_, Arc<AppState>>, path: Option<String>) -> Result<View, String> {
     with_session(&state, |s| s.view(path.as_deref()))?
         .ok_or_else(|| "That folder isn't in the scan.".into())
 }
 
 #[tauri::command]
-fn plan_path(state: State<'_, Arc<AppState>>, path: String) -> Result<Plan, String> {
+async fn plan_path(state: State<'_, Arc<AppState>>, path: String) -> Result<Plan, String> {
     with_session(&state, |s| s.plan_path(&path))
 }
 
+/// Suggestions are named by id: positions change when they re-sort.
 #[tauri::command]
-fn plan_finding(state: State<'_, Arc<AppState>>, index: usize) -> Result<Plan, String> {
-    with_session(&state, |s| s.plan_finding(index))
+async fn plan_finding(state: State<'_, Arc<AppState>>, id: String) -> Result<Plan, String> {
+    with_session(&state, |s| s.plan_finding(&id))
 }
 
+/// Moving to the Trash can take a while (copies across filesystems on Linux), so
+/// it runs on a blocking-friendly worker thread.
 #[tauri::command]
-fn trash(state: State<'_, Arc<AppState>>, paths: Vec<String>) -> Result<TrashResult, String> {
-    with_session(&state, |s| s.trash_for_real(&paths))
+async fn trash(state: State<'_, Arc<AppState>>, paths: Vec<String>) -> Result<TrashResult, String> {
+    let state = Arc::clone(&state);
+    tauri::async_runtime::spawn_blocking(move || with_session(&state, |s| s.trash_for_real(&paths)))
+        .await
+        .map_err(|e| format!("Moving to the Trash stopped unexpectedly: {e}"))?
 }
 
 /// Show an item in Finder (macOS) or its folder in the file manager (Linux).
 #[tauri::command]
-fn reveal(state: State<'_, Arc<AppState>>, path: String) -> Result<(), String> {
+async fn reveal(state: State<'_, Arc<AppState>>, path: String) -> Result<(), String> {
     let real = with_session(&state, |s| s.snap.real_path(&path))?;
     #[cfg(target_os = "macos")]
     let status = std::process::Command::new("open")

@@ -20,10 +20,10 @@ const LEVELS = ["safe", "caution", "review"];
 const state = {
   summary: null,
   tab: "suggestions",
-  current: null, // index of the suggestion shown in the Suggestions section
+  current: null, // id of the suggestion shown in the Suggestions section
   view: null,
   selected: null, // path of the selected tile in Browse
-  highlight: null, // index of the suggestion shown on the map
+  highlight: null, // id of the suggestion shown on the map
   mode: "map",
 };
 
@@ -130,7 +130,8 @@ function badge(safety) {
 }
 
 function finding(i) {
-  return state.summary.findings.find((f) => f.index === i);
+  // Suggestions are named by id everywhere: positions change when they re-sort.
+  return state.summary.findings.find((f) => f.id === i);
 }
 
 let toastTimer;
@@ -154,7 +155,8 @@ function showScanning(title) {
   $("scan-note").textContent = "";
 }
 
-listen("scan-progress", (p) => {
+const listening = [];
+listening.push(listen("scan-progress", (p) => {
   $("scan-title").textContent = `Scanning ${p.root}`;
   $("scan-counts").textContent =
     `${p.files.toLocaleString()} files · ${p.dirs.toLocaleString()} folders · ${bytes(p.bytes)} · ${Math.round(p.seconds)}s`;
@@ -162,9 +164,9 @@ listen("scan-progress", (p) => {
     $("scan-note").textContent =
       "A whole-disk scan takes under a minute. Folders macOS protects are skipped unless diskwise has Full Disk Access.";
   }
-});
+}));
 
-listen("scan-done", async (done) => {
+listening.push(listen("scan-done", async (done) => {
   if (done.type === "failed") {
     $("scan-title").textContent = "The scan didn't finish";
     $("scan-counts").textContent = done.message;
@@ -181,7 +183,7 @@ listen("scan-done", async (done) => {
   renderSuggestions();
   await navigate(state.summary.root);
   setTab("suggestions");
-});
+}));
 
 $("rescan").addEventListener("click", () => {
   showScanning("Starting the scan…");
@@ -219,7 +221,7 @@ $("tab-browse").addEventListener("click", () => setTab("browse"));
 
 /** Suggestion indexes in display order: by safety level, then as analysed (largest first). */
 function inOrder() {
-  return LEVELS.flatMap((k) => state.summary.findings.filter((f) => f.safety === k).map((f) => f.index));
+  return LEVELS.flatMap((k) => state.summary.findings.filter((f) => f.safety === k).map((f) => f.id));
 }
 function firstInOrder() {
   return inOrder()[0] ?? null;
@@ -232,6 +234,9 @@ function renderSuggestions() {
     LEVELS.map((k) =>
       h("div", { class: "total" }, h("span", { class: "amount" }, bytes(s[k])), h("span", { class: "label" }, badge(k), SAFETY[k].total)),
     ),
+    s.live
+      ? null
+      : h("p", { class: "unreadable" }, "This is a saved scan, so nothing can be moved to the Trash from it. Scan again to act on it."),
     s.unreadable
       ? h("p", { class: "unreadable" }, `${s.unreadable.toLocaleString()} folders couldn't be read. Give diskwise Full Disk Access to include them.`)
       : null,
@@ -257,9 +262,9 @@ function renderSuggestions() {
             {
               type: "button",
               class: "sg-row",
-              "data-index": f.index,
-              "aria-current": f.index === state.current ? "true" : null,
-              onclick: () => showSuggestion(f.index),
+              "data-id": f.id,
+              "aria-current": f.id === state.current ? "true" : null,
+              onclick: () => showSuggestion(f.id),
             },
             h("span", { class: "sg-title" }, f.title),
             h("span", { class: "sg-size" }, f.size_known ? bytes(f.bytes) : "size ?"),
@@ -274,10 +279,10 @@ function renderSuggestions() {
   renderSuggestionDetail();
 }
 
-function showSuggestion(index) {
-  state.current = index;
+function showSuggestion(id) {
+  state.current = id;
   for (const row of document.querySelectorAll(".sg-row")) {
-    if (Number(row.dataset.index) === index) row.setAttribute("aria-current", "true");
+    if (row.dataset.id === id) row.setAttribute("aria-current", "true");
     else row.removeAttribute("aria-current");
   }
   renderSuggestionDetail();
@@ -321,7 +326,7 @@ function renderSuggestionDetail() {
       f.can_trash
         ? h(
             "button",
-            { type: "button", class: "btn", onclick: async () => showPlan(await invoke("plan_finding", { index: f.index })) },
+            { type: "button", class: "btn", onclick: async () => showPlan(await invoke("plan_finding", { id: f.id })) },
             f.items.length > 1 ? `Move ${f.items.length} items to Trash…` : "Move to Trash…",
           )
         : null,
@@ -382,7 +387,7 @@ $("as-map").addEventListener("click", () => setMode("map"));
 $("as-list").addEventListener("click", () => setMode("list"));
 
 async function showOnMap(f) {
-  state.highlight = f.index;
+  state.highlight = f.id;
   state.mode = "map";
   $("as-map").setAttribute("aria-selected", "true");
   $("as-list").setAttribute("aria-selected", "false");
@@ -396,10 +401,10 @@ function clearHighlight() {
   renderBody();
 }
 
-function backToSuggestion(index) {
-  showSuggestion(index);
+function backToSuggestion(id) {
+  showSuggestion(id);
   setTab("suggestions");
-  document.querySelector(`.sg-row[data-index="${index}"]`)?.scrollIntoView({ block: "nearest" });
+  document.querySelector(`.sg-row[data-id="${CSS.escape(id)}"]`)?.scrollIntoView({ block: "nearest" });
 }
 
 /** The suggestion shown on the map, with ways back and out. */
@@ -412,7 +417,7 @@ function renderChip() {
     chip,
     badge(f.safety),
     h("span", { class: "chip-title" }, `Showing ${f.title}`),
-    h("button", { type: "button", class: "chip-back", onclick: () => backToSuggestion(f.index) }, "Back to suggestion"),
+    h("button", { type: "button", class: "chip-back", onclick: () => backToSuggestion(f.id) }, "Back to suggestion"),
     h("button", { type: "button", class: "chip-x", "aria-label": "Stop showing this suggestion", onclick: clearHighlight }, "✕"),
   );
 }
@@ -677,7 +682,7 @@ function renderSelected() {
           { class: "callout" },
           h("h3", {}, badge(f.safety), t.direct ? f.title : `Inside "${f.title}"`),
           h("p", { class: "f-how" }, rich(f.how)),
-          h("button", { type: "button", class: "link", onclick: () => backToSuggestion(f.index) }, "Read the whole suggestion"),
+          h("button", { type: "button", class: "link", onclick: () => backToSuggestion(f.id) }, "Read the whole suggestion"),
         )
       : t.cleanable
         ? h("div", { class: "callout" }, h("h3", {}, badge("safe"), `${bytes(t.cleanable)} cleanable inside`), h("p", { class: "f-why" }, "Open it to see where."))
@@ -748,7 +753,7 @@ document.addEventListener("keydown", (e) => {
       const next = order[Math.max(0, Math.min(order.length - 1, i + (e.key === "ArrowDown" ? 1 : -1)))];
       if (next !== undefined) {
         showSuggestion(next);
-        document.querySelector(`.sg-row[data-index="${next}"]`)?.scrollIntoView({ block: "nearest" });
+        document.querySelector(`.sg-row[data-id="${CSS.escape(next)}"]`)?.scrollIntoView({ block: "nearest" });
       }
     }
     return;
@@ -763,7 +768,11 @@ document.addEventListener("keydown", (e) => {
 
 // ── Start ──────────────────────────────────────────────────────────────────
 
-invoke("start_scan", { rescan: false }).catch((e) => {
-  $("scan-title").textContent = "Couldn't start";
-  $("scan-counts").textContent = String(e);
-});
+// Start only once both listeners are registered: a small saved snapshot can load
+// before an unawaited listen() is in place, leaving the app on "Scanning" forever.
+Promise.all(listening)
+  .then(() => invoke("start_scan", { rescan: false }))
+  .catch((e) => {
+    $("scan-title").textContent = "Couldn't start";
+    $("scan-counts").textContent = String(e);
+  });

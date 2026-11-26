@@ -38,7 +38,7 @@ works locally or over SSH:
 - **Suggestions** (opens here; `1`): the `suggest` list; Enter jumps to the item in the
   browser.
 - **Browse** (Tab or `2`): folders by size with bars. Items a suggestion covers are tagged
-  and colour-coded (green safe, yellow caution, pink review); folders show how
+  and colour-coded (blue safe, amber caution, pink review: checked for colour-vision deficiency); folders show how
   much is cleanable inside them. The details pane says what an item is and how
   to clear it.
 - **Move to Trash** (`d`): always asks first, showing the exact paths, total,
@@ -132,6 +132,25 @@ Run from a terminal, the app inherits the terminal's Full Disk Access. A bundled
 To check the UI without running the app, `crates/diskwise-app/dev/preview.sh`
 screenshots the real `ui/` in headless Chrome against fixtures made from a
 snapshot (the fixtures hold real paths and are git-ignored).
+
+## Moving things to the Trash, safely
+
+Both the TUI and the desktop app go through one check before anything moves:
+
+- Never deleted outright, only moved to the Trash, and only after a confirmation
+  that shows the exact paths.
+- Refused: the scanned folder itself; top-level folders; every home folder
+  (including relocated ones, e.g. `/var/home` on Fedora Silverblue, found via
+  `$HOME` and the user database); system and package-manager trees (`/System`,
+  `/Library`, `/private`, `/usr`, `/opt/homebrew` on macOS; `/usr`, `/etc`,
+  `/var/lib`, `/boot`, … on Linux).
+- Refused if the item has changed since the scan (gone, or a different kind or
+  size), if its name isn't valid UTF-8 (diskwise can't name it exactly), or if
+  the scan came from another OS.
+- Nothing is moved from a saved snapshot (`--from`): it may be stale or from
+  another machine. Scan again first.
+- Items outside home folders that no suggestion covers get a stronger warning.
+- After moving, each path is checked to be really gone.
 
 ## Suggestions
 

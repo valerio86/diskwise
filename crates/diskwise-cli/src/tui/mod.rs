@@ -49,7 +49,11 @@ fn run_inner(terminal: &mut DefaultTerminal, opts: &Options) -> Result<()> {
         let findings = diskwise_core::analyze(&snap, &rules, crate::now());
         let mut app = App::new(snap, findings);
         if from_saved {
-            app.status = Some("Showing a saved snapshot. Press r to rescan.".into());
+            app.status = Some(
+                "Showing a saved scan: press r to scan again before moving anything to the Trash."
+                    .into(),
+            );
+            app.live = false;
             from_saved = false;
         }
 

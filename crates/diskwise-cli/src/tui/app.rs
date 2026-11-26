@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+use diskwise_core::actions::{Protection, check_trash};
 use diskwise_core::rules::{Action, Safety};
 use diskwise_core::{Finding, Node, NodeKind, Platform, Snapshot};
 
@@ -86,6 +87,10 @@ pub struct App {
     pub quit: bool,
     /// Set when the user asks for a fresh scan; the event loop handles it.
     pub rescan_requested: bool,
+    /// Scanned in this run. A snapshot loaded from a file may be stale or from
+    /// another machine, so nothing is moved to the Trash until a rescan.
+    pub live: bool,
+    protection: Protection,
 }
 
 impl App {
@@ -114,6 +119,8 @@ impl App {
             status: None,
             quit: false,
             rescan_requested: false,
+            live: true,
+            protection: Protection::for_platform(platform),
         };
         // The scanner sorts "(smaller items)" by size like everything else; here it
         // always goes last.
@@ -357,6 +364,13 @@ impl App {
 
     /// Ask to move the selected entry (Browse) or a suggestion's items to the Trash.
     pub fn request_trash(&mut self) {
+        if !self.live {
+            self.modal = Some(Modal::Message {
+                title: "Scan again first".into(),
+                body: "This is a saved scan. It may be out of date or from another machine, so diskwise won't move anything to the Trash from it. Press r to scan again.".into(),
+            });
+            return;
+        }
         match self.tab {
             Tab::Browse => {
                 let Some(node) = self.selected_node() else {
@@ -375,9 +389,9 @@ impl App {
                 };
                 let link_target = (node.kind == NodeKind::Link)
                     .then(|| node.target.clone().unwrap_or_else(|| "its target".into()));
-                if let Some(reason) = self.protected_reason(&path) {
+                if let Err(reason) = self.check(&path) {
                     self.modal = Some(Modal::Message {
-                        title: "Protected folder".into(),
+                        title: "Can't move this to the Trash".into(),
                         body: reason,
                     });
                     return;
@@ -392,6 +406,7 @@ impl App {
                     return;
                 }
                 let coverage = self.coverage(&path).map(|c| (c.finding.clone(), c.direct));
+                let in_home = self.protection.in_home(&path);
                 self.modal = Some(match coverage {
                     Some((f, _)) if !matches!(f.action, Action::Trash | Action::Archive) => {
                         refusal(&f)
@@ -400,10 +415,16 @@ impl App {
                         targets: vec![target],
                         warning: warning_for(&f, direct),
                     },
-                    None => Modal::ConfirmTrash {
+                    None if in_home => Modal::ConfirmTrash {
                         targets: vec![target],
                         warning: Some(
                             "No suggestion covers this item. Make sure you don't need it.".into(),
+                        ),
+                    },
+                    None => Modal::ConfirmTrash {
+                        targets: vec![target],
+                        warning: Some(
+                            "This is outside your home folder and no suggestion covers it. Apps and system tools may depend on it: only continue if you know what it is.".into(),
                         ),
                     },
                 });
@@ -419,21 +440,26 @@ impl App {
                 let (allowed, protected): (Vec<_>, Vec<_>) = f
                     .items
                     .iter()
-                    .partition(|i| self.protected_reason(&i.path).is_none());
+                    .map(|i| (i, self.check(&i.path)))
+                    .partition(|(_, r)| r.is_ok());
                 if allowed.is_empty() {
+                    let why = protected
+                        .first()
+                        .and_then(|(_, r)| r.clone().err())
+                        .unwrap_or_default();
                     self.modal = Some(Modal::Message {
                         title: "Nothing to move".into(),
-                        body: "Every item in this suggestion is a top-level or home folder, which diskwise won't move to the Trash.".into(),
+                        body: format!("diskwise can't move any of these items. {why}"),
                     });
                     return;
                 }
                 let mut warning = warning_for(&f, true);
                 if !protected.is_empty() {
                     let note = format!(
-                        "Left out (protected folders): {}.",
+                        "Left out: {}.",
                         protected
                             .iter()
-                            .map(|i| i.path.as_str())
+                            .map(|(i, _)| i.path.as_str())
                             .collect::<Vec<_>>()
                             .join(", ")
                     );
@@ -444,7 +470,7 @@ impl App {
                 }
                 let targets = allowed
                     .into_iter()
-                    .map(|i| TrashTarget {
+                    .map(|(i, _)| TrashTarget {
                         path: i.path.clone(),
                         bytes: i.bytes,
                     })
@@ -455,8 +481,14 @@ impl App {
     }
 
     /// Paths diskwise refuses to trash however they're selected.
+    #[cfg(test)]
     fn protected_reason(&self, path: &str) -> Option<String> {
-        diskwise_core::actions::protected_reason(path, self.platform)
+        self.protection.reason(path)
+    }
+
+    /// Every reason not to trash `path` now (shared with the desktop app).
+    fn check(&self, path: &str) -> Result<(), String> {
+        check_trash(&self.snap, path, &self.protection)
     }
 
     /// Move the confirmed targets to the Trash with `trasher`, then verify each is
@@ -470,6 +502,19 @@ impl App {
         let mut moved_count = 0;
         let mut failures = Vec::new();
         for t in targets {
+            // Re-check at the moment of acting: the disk may have changed since the
+            // dialog opened.
+            if !self.live {
+                failures.push(format!(
+                    "{}: this is a saved scan; scan again first",
+                    t.path
+                ));
+                continue;
+            }
+            if let Err(reason) = self.check(&t.path) {
+                failures.push(reason);
+                continue;
+            }
             let real = self.real_path(&t.path);
             match trasher(Path::new(&real)) {
                 Err(e) => failures.push(format!("{}: {e}", t.path)),
@@ -644,7 +689,7 @@ fn sort_tree(node: &mut Node, sort: SortBy) {
 }
 
 #[cfg(test)]
-pub(super) use test_support::sample_app;
+pub(super) use test_support::{disk_app, sample_app};
 
 #[cfg(test)]
 mod test_support {
@@ -668,6 +713,7 @@ mod test_support {
     fn file(name: &str, size: u64) -> Node {
         let mut n = Node::new(name.into(), NodeKind::File);
         n.allocated = size;
+        n.logical = size;
         n.files = 1;
         n
     }
@@ -697,8 +743,24 @@ mod test_support {
         }
     }
 
-    /// A Linux-style snapshot rooted at `root` (a real temp dir, so trashing can be
-    /// exercised with a fake trasher that deletes files).
+    /// The sample tree, also created on disk (under target/, not the system temp
+    /// dir, which macOS keeps in protected /private) so trash checks can pass.
+    /// Returns the canonical root and the directory to clean up.
+    pub fn disk_app(tag: &str) -> (App, String, std::path::PathBuf) {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/test-tmp")
+            .join(format!("tui-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("home/v/cache")).unwrap();
+        std::fs::create_dir_all(dir.join("home/v/docs")).unwrap();
+        std::fs::write(dir.join("home/v/cache/a"), vec![0u8; 300]).unwrap();
+        std::fs::write(dir.join("home/v/cache/b"), vec![0u8; 100]).unwrap();
+        std::fs::write(dir.join("home/v/docs/c"), vec![0u8; 200]).unwrap();
+        let r = std::fs::canonicalize(&dir).unwrap().display().to_string();
+        (sample_app(&r), r, dir)
+    }
+
+    /// A snapshot rooted at `root` (made up unless created by `disk_app`).
     pub fn sample_app(root: &str) -> App {
         let tree = dir(
             root,
@@ -715,7 +777,7 @@ mod test_support {
         );
         let snap = Snapshot {
             version: SNAPSHOT_VERSION,
-            os: "linux".into(),
+            os: diskwise_core::platform::CURRENT.os.into(),
             root: root.into(),
             scanned_at: 0,
             duration_ms: 0,
@@ -788,21 +850,48 @@ mod tests {
 
     #[test]
     fn refuses_in_app_and_protected_items() {
-        let mut app = app_at("/r");
-        app.reveal("/r/home/v/docs");
+        let (mut app, r, dir) = disk_app("refuse");
+        app.reveal(&format!("{r}/home/v/docs"));
         app.request_trash();
         assert!(
             matches!(app.modal.take(), Some(Modal::Message { .. })),
             "in-app item"
         );
-        app.reveal("/r/home/v");
+        app.reveal(&format!("{r}/home/v"));
         app.request_trash();
-        // /r/home/v is not under the Linux home base (/home), but depth 3 is fine;
-        // the real home folder is protected:
         assert!(matches!(app.modal.take(), Some(Modal::ConfirmTrash { .. })));
-        assert!(app.protected_reason("/home/v").is_some());
         assert!(app.protected_reason("/usr").is_some());
-        assert!(app.protected_reason("/home/v/cache").is_none());
+        assert!(
+            app.protected_reason(&std::env::var("HOME").unwrap())
+                .is_some(),
+            "your home"
+        );
+        // Gone from disk since the scan: refused, not trashed blindly.
+        std::fs::remove_dir_all(dir.join("home/v/docs")).unwrap();
+        app.reveal(&format!("{r}/home/v/docs"));
+        app.tab = Tab::Browse;
+        app.request_trash();
+        assert!(matches!(app.modal.take(), Some(Modal::Message { .. })));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn saved_snapshots_never_trash() {
+        let (mut app, r, dir) = disk_app("saved");
+        app.live = false;
+        app.reveal(&format!("{r}/home/v/cache"));
+        app.request_trash();
+        assert!(matches!(app.modal.take(), Some(Modal::Message { .. })));
+        let msg = app.apply_trash(
+            &[TrashTarget {
+                path: format!("{r}/home/v/cache"),
+                bytes: 400,
+            }],
+            |p| std::fs::remove_dir_all(p).map_err(|e| e.to_string()),
+        );
+        assert!(msg.contains("saved scan"), "{msg}");
+        assert!(dir.join("home/v/cache").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -827,12 +916,7 @@ mod tests {
 
     #[test]
     fn trash_verifies_and_updates_tree() {
-        let root = std::env::temp_dir().join(format!("diskwise-tui-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(root.join("home/v/cache")).unwrap();
-        std::fs::create_dir_all(root.join("home/v/docs")).unwrap();
-        let root_s = root.display().to_string();
-        let mut app = app_at(&root_s);
+        let (mut app, root_s, root) = disk_app("verify");
         let cache = format!("{root_s}/home/v/cache");
         let docs = format!("{root_s}/home/v/docs");
         app.reveal(&cache);
@@ -883,12 +967,7 @@ mod tests {
 
     #[test]
     fn trashing_inside_an_item_shrinks_that_item() {
-        let root = std::env::temp_dir().join(format!("diskwise-inside-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(root.join("home/v/cache")).unwrap();
-        std::fs::write(root.join("home/v/cache/a"), b"x").unwrap();
-        let r = root.display().to_string();
-        let mut app = app_at(&r);
+        let (mut app, r, root) = disk_app("inside");
         let inner = format!("{r}/home/v/cache/a");
         app.apply_trash(
             &[TrashTarget {
@@ -906,7 +985,7 @@ mod tests {
 
     #[test]
     fn trash_all_explains_protected_items() {
-        let mut app = app_at("/r");
+        let (mut app, r, dir) = disk_app("trashall");
         // A finding whose only item is a protected top-level folder.
         app.findings = vec![finding_for_test("top", "/usr")];
         app.reindex();
@@ -919,7 +998,7 @@ mod tests {
         // Mixed: the protected one is named in the warning.
         app.findings = vec![
             finding_for_test("mixed", "/usr"),
-            finding_for_test("x", "/r/home/v/cache"),
+            finding_for_test("x", &format!("{r}/home/v/cache")),
         ];
         let extra = app.findings[1].items[0].clone();
         app.findings[0].items.push(extra);
@@ -933,6 +1012,7 @@ mod tests {
             }
             other => panic!("expected a confirmation, got {other:?}"),
         }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     fn finding_for_test(id: &str, path: &str) -> Finding {
@@ -944,13 +1024,8 @@ mod tests {
 
     #[test]
     fn links_warn_and_follow() {
-        let root = std::env::temp_dir().join(format!("diskwise-link-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(root.join("home/v/docs")).unwrap();
+        let (mut app, r, root) = disk_app("link");
         std::os::unix::fs::symlink(root.join("home/v/docs"), root.join("home/v/shortcut")).unwrap();
-        // Canonical form, as the scanner records roots (macOS temp dirs are symlinks).
-        let r = std::fs::canonicalize(&root).unwrap().display().to_string();
-        let mut app = app_at(&r);
         let mut link = Node::new("shortcut".into(), NodeKind::Link);
         link.target = Some(format!("{r}/home/v/docs"));
         let v = app.locate(&format!("{r}/home/v")).unwrap();

@@ -116,15 +116,21 @@ impl Finding {
 pub fn analyze(snap: &Snapshot, rules: &RuleSet, now: i64) -> Vec<Finding> {
     let mut by_rule: HashMap<usize, Finding> = HashMap::new();
     let root = snap.platform().display_path(&snap.root);
-    walk(&snap.tree, &root, rules, now, &mut by_rule);
+    walk(snap, &snap.tree, &root, rules, now, &mut by_rule);
 
     let mut findings: Vec<Finding> = by_rule.into_values().collect();
     for f in &mut findings {
         f.items.sort_by_key(|i| std::cmp::Reverse(i.bytes));
     }
     findings.extend(system_findings(snap));
+    // Ties broken by id: findings come out of a HashMap, and an order that changes
+    // between runs (or after a trash) would move suggestions around the UI.
     findings.sort_by(|a, b| {
-        (a.safety, std::cmp::Reverse(a.bytes)).cmp(&(b.safety, std::cmp::Reverse(b.bytes)))
+        (a.safety, std::cmp::Reverse(a.bytes), &a.id).cmp(&(
+            b.safety,
+            std::cmp::Reverse(b.bytes),
+            &b.id,
+        ))
     });
     findings
 }
@@ -137,7 +143,14 @@ fn join(dir: &str, name: &str) -> String {
     }
 }
 
-fn walk(node: &Node, path: &str, rules: &RuleSet, now: i64, out: &mut HashMap<usize, Finding>) {
+fn walk(
+    snap: &Snapshot,
+    node: &Node,
+    path: &str,
+    rules: &RuleSet,
+    now: i64,
+    out: &mut HashMap<usize, Finding>,
+) {
     for child in &node.children {
         // Links are never claimed by rules: they take almost no space, and moving
         // one to the Trash wouldn't free what it points to.
@@ -145,10 +158,12 @@ fn walk(node: &Node, path: &str, rules: &RuleSet, now: i64, out: &mut HashMap<us
             continue;
         }
         let child_path = join(path, &child.name);
-        match rules.rule_for(&child_path, child, now) {
+        // Rules match the path users see; disk checks need where it really is.
+        let fs_path = snap.real_path(&child_path);
+        match rules.rule_for_at(&child_path, &fs_path, child, now) {
             Some((idx, rule)) => {
                 let source = if child.kind == NodeKind::File {
-                    download_hosts(Path::new(&child_path)).into_iter().next()
+                    download_hosts(Path::new(&fs_path)).into_iter().next()
                 } else {
                     None
                 };
@@ -175,7 +190,7 @@ fn walk(node: &Node, path: &str, rules: &RuleSet, now: i64, out: &mut HashMap<us
                     source,
                 });
             }
-            None => walk(child, &child_path, rules, now, out),
+            None => walk(snap, child, &child_path, rules, now, out),
         }
     }
 }
@@ -502,6 +517,40 @@ mod tests {
             NOW,
         );
         assert!(findings.iter().all(|f| f.id != "user-caches"));
+    }
+
+    #[test]
+    fn order_is_stable_for_equal_sizes() {
+        let tree = dir(
+            platform::MACOS.default_root,
+            vec![dir(
+                "Users",
+                vec![dir(
+                    "v",
+                    vec![
+                        dir(
+                            "Library",
+                            vec![dir("Logs", vec![dir("A", vec![file("x", GB, 1)])])],
+                        ),
+                        dir("Library2", vec![]),
+                        dir(".npm", vec![dir("_cacache", vec![file("y", GB, 1)])]),
+                    ],
+                )],
+            )],
+        );
+        let snap = snapshot(tree, 0);
+        let rules = RuleSet::builtin_for(&platform::MACOS).unwrap();
+        let first: Vec<String> = analyze(&snap, &rules, NOW)
+            .into_iter()
+            .map(|f| f.id)
+            .collect();
+        for _ in 0..20 {
+            let again: Vec<String> = analyze(&snap, &rules, NOW)
+                .into_iter()
+                .map(|f| f.id)
+                .collect();
+            assert_eq!(first, again);
+        }
     }
 
     #[test]

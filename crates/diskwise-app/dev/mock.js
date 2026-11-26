@@ -2,7 +2,7 @@
 // fixtures from a real snapshot (see write_preview_fixture in session.rs).
 // URL parameters drive the starting state for screenshots:
 //   ?path=/Users/x/Library   open a folder        &select=/Users/x/Library/Caches
-//   &finding=3               show suggestion 3     &show=1  show it on the map
+//   &finding=python-venv     show a suggestion     &show=1  show it on the map
 //   &tab=browse              start in Browse
 //   &mode=list               list view             &trash=/path  open the trash dialog
 "use strict";
@@ -25,8 +25,8 @@
       throw "That folder isn't in the preview fixture.";
     },
     plan_path: ({ path }) => plan([{ path, bytes: 330100000 }], null),
-    plan_finding: ({ index }) => {
-      const f = F.summary.findings.find((x) => x.index === index);
+    plan_finding: ({ id }) => {
+      const f = F.summary.findings.find((x) => x.id === id);
       return plan(f.items.map((i) => ({ path: i.path, bytes: i.bytes })), "Before you confirm: quit the app first.");
     },
     trash: ({ paths }) => ({ moved: paths.length, bytes: 0, failures: [], message: "Preview: nothing was moved." }),
@@ -44,8 +44,8 @@
   window.addEventListener("load", () => {
     const q = new URLSearchParams(location.search);
     setTimeout(async () => {
-      if (q.get("finding")) showSuggestion(Number(q.get("finding")));
-      if (q.get("show")) await showOnMap(finding(Number(q.get("finding"))));
+      if (q.get("finding")) showSuggestion(q.get("finding"));
+      if (q.get("show")) await showOnMap(finding(q.get("finding")));
       if (q.get("tab")) setTab(q.get("tab"));
       if (q.get("mode")) setMode(q.get("mode"));
       if (q.get("path")) await navigate(q.get("path"));
