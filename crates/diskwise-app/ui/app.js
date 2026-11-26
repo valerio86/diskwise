@@ -1,5 +1,9 @@
 // diskwise desktop UI. Plain JS, no build step: talks to the Rust side through
 // Tauri's global API (or the preview mock in dev/).
+//
+// Two sections, like the TUI: Suggestions (what to do; opens first) and Browse
+// (where space goes). "Show on map" jumps from a suggestion to Browse with its
+// items highlighted, and the chip there jumps back.
 "use strict";
 
 const tauri = window.__TAURI__;
@@ -7,17 +11,19 @@ const invoke = (cmd, args) => tauri.core.invoke(cmd, args);
 const listen = (event, cb) => tauri.event.listen(event, (e) => cb(e.payload));
 
 const SAFETY = {
-  safe: { icon: "✓", group: "Safe to clean", total: "safe to clean now" },
-  caution: { icon: "!", group: "Safe after a step", total: "after a quick step" },
-  review: { icon: "?", group: "Your call", total: "worth reviewing" },
+  safe: { group: "Safe to clean", total: "safe to clean now", label: "Safe to clean" },
+  caution: { group: "Safe after a step", total: "after a quick step", label: "Safe after a step" },
+  review: { group: "Your call", total: "worth reviewing", label: "Your call" },
 };
+const LEVELS = ["safe", "caution", "review"];
 
 const state = {
   summary: null,
+  tab: "suggestions",
+  current: null, // index of the suggestion shown in the Suggestions section
   view: null,
-  selected: null, // path of the selected tile
+  selected: null, // path of the selected tile in Browse
   highlight: null, // index of the suggestion shown on the map
-  open: new Set(), // suggestions expanded in the side panel
   mode: "map",
 };
 
@@ -38,8 +44,7 @@ function h(tag, attrs = {}, ...children) {
         if (prop.startsWith("--")) el.style.setProperty(prop, val);
         else el.style[prop] = val;
       }
-    }
-    else el.setAttribute(k, v === true ? "" : v);
+    } else el.setAttribute(k, v === true ? "" : v);
   }
   for (const c of children.flat()) {
     if (c === null || c === undefined || c === false) continue;
@@ -97,7 +102,9 @@ function toast(message) {
 
 function showScanning(title) {
   $("scanning").hidden = false;
-  $("layout").hidden = true;
+  $("view-suggestions").hidden = true;
+  $("view-browse").hidden = true;
+  $("main-tabs").hidden = true;
   $("scan-title").textContent = title;
   $("scan-counts").textContent = "";
   $("scan-note").textContent = "";
@@ -122,13 +129,14 @@ listen("scan-done", async (done) => {
   }
   state.summary = await invoke("summary");
   state.highlight = null;
-  state.open.clear();
+  state.current = firstInOrder();
   $("scanning").hidden = true;
-  $("layout").hidden = false;
+  $("main-tabs").hidden = false;
   $("rescan").hidden = false;
   renderDisk();
   renderSuggestions();
   await navigate(state.summary.root);
+  setTab("suggestions");
 });
 
 $("rescan").addEventListener("click", () => {
@@ -136,7 +144,7 @@ $("rescan").addEventListener("click", () => {
   invoke("start_scan", { rescan: true }).catch((e) => toast(String(e)));
 });
 
-// ── Header ─────────────────────────────────────────────────────────────────
+// ── Header and sections ────────────────────────────────────────────────────
 
 function renderDisk() {
   const d = state.summary.disk;
@@ -150,7 +158,135 @@ function renderDisk() {
   $("disk-free").textContent = `${bytes(d.free)} free of ${bytes(d.capacity)}`;
 }
 
-// ── Navigation ─────────────────────────────────────────────────────────────
+function setTab(tab) {
+  state.tab = tab;
+  $("tab-suggestions").setAttribute("aria-selected", tab === "suggestions");
+  $("tab-browse").setAttribute("aria-selected", tab === "browse");
+  $("view-suggestions").hidden = tab !== "suggestions";
+  $("view-browse").hidden = tab !== "browse";
+  hideTooltip();
+  // The map lays out from its size, which is zero while hidden.
+  if (tab === "browse" && state.view) renderBody();
+}
+$("tab-suggestions").addEventListener("click", () => setTab("suggestions"));
+$("tab-browse").addEventListener("click", () => setTab("browse"));
+
+// ── Suggestions section ────────────────────────────────────────────────────
+
+/** Suggestion indexes in display order: by safety level, then as analysed (largest first). */
+function inOrder() {
+  return LEVELS.flatMap((k) => state.summary.findings.filter((f) => f.safety === k).map((f) => f.index));
+}
+function firstInOrder() {
+  return inOrder()[0] ?? null;
+}
+
+function renderSuggestions() {
+  const s = state.summary;
+  fill(
+    $("totals"),
+    LEVELS.map((k) =>
+      h("div", { class: "total" }, h("span", { class: "amount" }, bytes(s[k])), h("span", { class: "label" }, badge(k), SAFETY[k].total)),
+    ),
+    s.unreadable
+      ? h("p", { class: "unreadable" }, `${s.unreadable.toLocaleString()} folders couldn't be read. Give diskwise Full Disk Access to include them.`)
+      : null,
+  );
+
+  // Bars measure space you can free, on one scale across all suggestions so
+  // lengths compare directly. Explanations (nothing to delete) get no bar: a
+  // 21 GB "space the scan can't see" bar would dwarf what's really reclaimable.
+  const frees = (f) => f.size_known && f.action !== "info";
+  const largest = Math.max(1, ...s.findings.filter(frees).map((f) => f.bytes));
+  fill(
+    $("sg-list"),
+    LEVELS.map((k) => {
+      const fs = s.findings.filter((f) => f.safety === k);
+      if (!fs.length) return null;
+      return h(
+        "section",
+        { class: "sg-group" },
+        h("h2", {}, badge(k), SAFETY[k].group),
+        fs.map((f) =>
+          h(
+            "button",
+            {
+              type: "button",
+              class: "sg-row",
+              "data-index": f.index,
+              "aria-current": f.index === state.current ? "true" : null,
+              onclick: () => showSuggestion(f.index),
+            },
+            h("span", { class: "sg-title" }, f.title),
+            h("span", { class: "sg-size" }, f.size_known ? bytes(f.bytes) : "size ?"),
+            frees(f)
+              ? h("span", { class: "sg-bar", "aria-hidden": "true" }, h("span", { class: `sg-fill b-${k}`, style: { width: `${(f.bytes / largest) * 100}%` } }))
+              : h("span", { class: "sg-explains" }, "Explains space · nothing to delete"),
+          ),
+        ),
+      );
+    }),
+  );
+  renderSuggestionDetail();
+}
+
+function showSuggestion(index) {
+  state.current = index;
+  for (const row of document.querySelectorAll(".sg-row")) {
+    if (Number(row.dataset.index) === index) row.setAttribute("aria-current", "true");
+    else row.removeAttribute("aria-current");
+  }
+  renderSuggestionDetail();
+}
+
+function renderSuggestionDetail() {
+  const pane = $("sg-detail");
+  const f = state.current !== null ? finding(state.current) : null;
+  if (!f) {
+    fill(pane, h("p", { class: "empty" }, "No suggestions: nothing diskwise recognises takes up notable space."));
+    return;
+  }
+  const items = f.items.map((i) =>
+    h(
+      "li",
+      {},
+      h("span", { class: "i-size" }, bytes(i.bytes)),
+      h("span", { class: "i-path" }, i.path),
+      i.source ? h("span", { class: "i-source" }, `from ${i.source}`) : null,
+    ),
+  );
+  fill(
+    pane,
+    h(
+      "header",
+      { class: "sd-head" },
+      h("p", { class: "sd-level" }, badge(f.safety), SAFETY[f.safety].label, h("span", { class: "sd-meta" }, `${f.category_label} · ${f.action_label}`)),
+      h("h1", {}, f.title),
+      h("p", { class: "sd-size" }, f.size_known ? bytes(f.bytes) : "Size not reported by the system"),
+    ),
+    h("p", { class: "sd-why" }, f.why),
+    h("section", { class: "sd-block" }, h("h2", {}, "What to do"), h("p", {}, f.how)),
+    f.prevent ? h("section", { class: "sd-block" }, h("h2", {}, "To stop it coming back"), h("p", { class: "sd-code" }, f.prevent)) : null,
+    items.length
+      ? h("section", { class: "sd-block" }, h("h2", {}, f.items.length === 1 ? "Where" : `Where (${f.items.length} items)`), h("ul", { class: "sd-items" }, items))
+      : null,
+    h(
+      "div",
+      { class: "actions" },
+      f.items.length ? h("button", { type: "button", class: "btn primary", onclick: () => showOnMap(f) }, "Show on map") : null,
+      f.can_trash
+        ? h(
+            "button",
+            { type: "button", class: "btn", onclick: async () => showPlan(await invoke("plan_finding", { index: f.index })) },
+            f.items.length > 1 ? `Move ${f.items.length} items to Trash…` : "Move to Trash…",
+          )
+        : null,
+    ),
+  );
+  pane.scrollTop = 0;
+}
+
+// ── Browse section ─────────────────────────────────────────────────────────
 
 async function navigate(path, select = null) {
   try {
@@ -164,7 +300,7 @@ async function navigate(path, select = null) {
   }
   state.selected = select;
   renderCrumbs();
-  renderBody();
+  if (state.tab === "browse") renderBody();
   renderSelected();
 }
 
@@ -180,9 +316,7 @@ function renderCrumbs() {
     const last = i === state.view.crumbs.length - 1;
     if (i > 0) nav.append(h("span", { class: "sep", "aria-hidden": "true" }, "›"));
     const label = i === 0 && c.name === "/" ? "Disk" : c.name;
-    nav.append(
-      h("button", { type: "button", "aria-current": last ? "page" : null, onclick: () => !last && navigate(c.path) }, label),
-    );
+    nav.append(h("button", { type: "button", "aria-current": last ? "page" : null, onclick: () => !last && navigate(c.path) }, label));
   });
 }
 
@@ -198,10 +332,46 @@ function setMode(mode) {
   state.mode = mode;
   $("as-map").setAttribute("aria-selected", mode === "map");
   $("as-list").setAttribute("aria-selected", mode === "list");
-  renderBody();
+  if (state.view) renderBody();
 }
 $("as-map").addEventListener("click", () => setMode("map"));
 $("as-list").addEventListener("click", () => setMode("list"));
+
+async function showOnMap(f) {
+  state.highlight = f.index;
+  state.mode = "map";
+  $("as-map").setAttribute("aria-selected", "true");
+  $("as-list").setAttribute("aria-selected", "false");
+  await navigate(f.common_parent ?? state.summary.root);
+  setTab("browse");
+}
+
+function clearHighlight() {
+  if (state.highlight === null) return;
+  state.highlight = null;
+  renderBody();
+}
+
+function backToSuggestion(index) {
+  showSuggestion(index);
+  setTab("suggestions");
+  document.querySelector(`.sg-row[data-index="${index}"]`)?.scrollIntoView({ block: "nearest" });
+}
+
+/** The suggestion shown on the map, with ways back and out. */
+function renderChip() {
+  const chip = $("chip");
+  const f = state.highlight !== null ? finding(state.highlight) : null;
+  chip.hidden = !f;
+  if (!f) return;
+  fill(
+    chip,
+    badge(f.safety),
+    h("span", { class: "chip-title" }, `Showing ${f.title}`),
+    h("button", { type: "button", class: "chip-back", onclick: () => backToSuggestion(f.index) }, "Back to suggestion"),
+    h("button", { type: "button", class: "chip-x", "aria-label": "Stop showing this suggestion", onclick: clearHighlight }, "✕"),
+  );
+}
 
 /** Does this tile contain (or is it) one of the highlighted suggestion's items? */
 function isHit(tile) {
@@ -219,7 +389,6 @@ function select(tile) {
     if (el.classList.contains("tile")) el.setAttribute("aria-pressed", on);
     else el.setAttribute("aria-selected", on);
   }
-  setSideTab("selected");
   renderSelected();
 }
 
@@ -278,7 +447,7 @@ function squarify(values, x, y, w, h) {
 }
 
 function tileNote(t) {
-  if (t.safety && t.direct) return `${SAFETY[t.safety].icon} ${finding(t.finding)?.title ?? ""}`;
+  if (t.safety && t.direct) return finding(t.finding)?.title ?? null;
   if (t.kind === "rest") return `${(t.files + t.dirs).toLocaleString()} small items`;
   if (t.cleanable > 0) return `${bytes(t.cleanable)} cleanable inside`;
   return null;
@@ -309,37 +478,36 @@ function renderMap() {
     // deeper down is visible without opening them.
     const top = 8 + (showText ? 36 : 0) + (showNote ? 18 : 0) + 4;
     const nested = !t.direct && t.inner.length > 0 && w >= 120 && hgt - top >= 40 ? innerTiles(t, 9, top, w - 18, hgt - top - 9) : [];
-    const el = h(
-      "button",
-      {
-        type: "button",
-        class: `tile${isHit(t) ? " hit" : ""}`,
-        "data-kind": t.kind,
-        "data-safety": t.safety,
-        "data-direct": t.safety ? String(t.direct) : null,
-        "data-path": t.path,
-        "aria-pressed": t.path && t.path === state.selected ? "true" : "false",
-        "aria-label": `${name}, ${bytes(t.bytes)}${note ? `, ${note}` : ""}`,
-        style: { left: `${r.x + gap / 2}px`, top: `${r.y + gap / 2}px`, width: `${w}px`, height: `${hgt}px` },
-        onclick: () => select(t),
-        ondblclick: () => openTile(t),
-        onkeydown: (e) => e.key === "Enter" && (e.preventDefault(), openTile(t)),
-        onmousemove: (e) => showTooltip(e, t),
-        onmouseleave: hideTooltip,
-      },
-      showText ? h("span", { class: "t-name" }, name) : null,
-      showText ? h("span", { class: "t-size" }, bytes(t.bytes)) : null,
-      showNote ? h("span", { class: "t-note" }, note) : null,
-      nested,
-      // Too small for miniatures: a strip whose length is the cleanable share.
-      t.cleanable > 0 && !t.direct && !nested.length
-        ? h("span", { class: "t-strip", style: { width: `${Math.min(100, (t.cleanable / t.bytes) * 100)}%` } })
-        : null,
+    map.append(
+      h(
+        "button",
+        {
+          type: "button",
+          class: `tile${isHit(t) ? " hit" : ""}`,
+          "data-kind": t.kind,
+          "data-safety": t.safety,
+          "data-direct": t.safety ? String(t.direct) : null,
+          "data-path": t.path,
+          "aria-pressed": t.path && t.path === state.selected ? "true" : "false",
+          "aria-label": `${name}, ${bytes(t.bytes)}${note ? `, ${note}` : ""}`,
+          style: { left: `${r.x + gap / 2}px`, top: `${r.y + gap / 2}px`, width: `${w}px`, height: `${hgt}px` },
+          onclick: () => select(t),
+          ondblclick: () => openTile(t),
+          onkeydown: (e) => e.key === "Enter" && (e.preventDefault(), openTile(t)),
+          onmousemove: (e) => showTooltip(e, t),
+          onmouseleave: hideTooltip,
+        },
+        showText ? h("span", { class: "t-name" }, name) : null,
+        showText ? h("span", { class: "t-size" }, bytes(t.bytes)) : null,
+        showNote ? h("span", { class: "t-note" }, note) : null,
+        nested,
+        // Too small for miniatures: a strip whose length is the cleanable share.
+        t.cleanable > 0 && !t.direct && !nested.length
+          ? h("span", { class: "t-strip", style: { width: `${Math.min(100, (t.cleanable / t.bytes) * 100)}%` } })
+          : null,
+      ),
     );
-    map.append(el);
   });
-  const links = state.view.tiles.filter((t) => t.kind === "link").length;
-  if (links) map.setAttribute("title", `${links} link(s) to folders elsewhere are listed in the List view.`);
 }
 
 function innerTiles(t, x, y, w, hgt) {
@@ -367,7 +535,7 @@ function innerTiles(t, x, y, w, hgt) {
     .filter(Boolean);
 }
 
-new ResizeObserver(() => state.view && state.mode === "map" && renderMap()).observe($("map"));
+new ResizeObserver(() => state.view && state.tab === "browse" && state.mode === "map" && renderMap()).observe($("map"));
 
 function showTooltip(e, t) {
   const tip = $("tooltip");
@@ -381,7 +549,7 @@ function showTooltip(e, t) {
     rows.push(h("div", { class: "tt-row" }, badge("safe"), `${bytes(t.cleanable)} cleanable inside`));
   }
   if (t.openable) rows.push(h("div", { class: "tt-row" }, "Double-click to open"));
-  fill(tip, ...rows);
+  fill(tip, rows);
   tip.hidden = false;
   const x = Math.min(e.clientX + 14, window.innerWidth - tip.offsetWidth - 8);
   const y = Math.min(e.clientY + 16, window.innerHeight - tip.offsetHeight - 8);
@@ -395,7 +563,6 @@ function hideTooltip() {
 // ── List view ──────────────────────────────────────────────────────────────
 
 function renderList() {
-  const list = $("list");
   // Same order as the map, but "smaller items" always last.
   const ordered = [...state.view.tiles.filter((t) => t.kind !== "rest"), ...state.view.tiles.filter((t) => t.kind === "rest")];
   const rows = ordered.map((t) => {
@@ -417,13 +584,14 @@ function renderList() {
         onclick: () => select(t),
         ondblclick: () => openTile(t),
       },
-      h("td", { class: "name", style: t.kind === "link" ? { fontStyle: "italic", color: "var(--text-2)" } : null }, name),
+      h("td", { class: t.kind === "link" ? "name link-name" : "name" }, name),
       h("td", { class: "num" }, bytes(t.bytes)),
       h("td", { class: "num" }, `${pct.toFixed(1)}%`),
       h("td", {}, f ? [badge(f.safety), " ", t.direct ? f.title : `Inside ${f.title}`] : t.cleanable ? `${bytes(t.cleanable)} cleanable inside` : ""),
     );
   });
-  fill(list, 
+  fill(
+    $("list"),
     h(
       "table",
       {},
@@ -433,123 +601,29 @@ function renderList() {
   );
 }
 
-// ── Side panel ─────────────────────────────────────────────────────────────
-
-function setSideTab(tab) {
-  $("tab-suggestions").setAttribute("aria-selected", tab === "suggestions");
-  $("tab-selected").setAttribute("aria-selected", tab === "selected");
-  $("pane-suggestions").hidden = tab !== "suggestions";
-  $("pane-selected").hidden = tab !== "selected";
-}
-$("tab-suggestions").addEventListener("click", () => setSideTab("suggestions"));
-$("tab-selected").addEventListener("click", () => setSideTab("selected"));
-
-function renderSuggestions() {
-  const s = state.summary;
-  const pane = $("pane-suggestions");
-  const totals = h(
-    "div",
-    { class: "totals" },
-    ["safe", "caution", "review"].map((k) =>
-      h("div", { class: "total" }, h("span", { class: "amount" }, bytes(s[k])), badge(k), h("span", { class: "label" }, SAFETY[k].total)),
-    ),
-  );
-  const groups = ["safe", "caution", "review"].map((k) => {
-    const fs = s.findings.filter((f) => f.safety === k);
-    if (!fs.length) return null;
-    return [h("div", { class: "group" }, SAFETY[k].group), ...fs.map(findingRow)];
-  });
-  const note = s.unreadable
-    ? h("p", { class: "f-meta" }, `${s.unreadable.toLocaleString()} folders couldn't be read. Give diskwise Full Disk Access to include them.`)
-    : null;
-  fill(pane, totals, ...groups.flat().filter(Boolean), note);
-}
-
-function findingRow(f) {
-  const open = state.open.has(f.index);
-  const size = f.size_known ? bytes(f.bytes) : "size ?";
-  const row = h(
-    "div",
-    { class: "finding", "data-open": String(open) },
-    h(
-      "button",
-      {
-        type: "button",
-        "aria-expanded": String(open),
-        onclick: () => {
-          open ? state.open.delete(f.index) : state.open.add(f.index);
-          renderSuggestions();
-        },
-      },
-      badge(f.safety),
-      h("span", { class: "f-size" }, size),
-      h("span", { class: "f-title" }, f.title),
-    ),
-  );
-  if (!open) return row;
-  const items = f.items.slice(0, 5).map((i) =>
-    h("li", {}, h("span", { class: "i-size" }, bytes(i.bytes)), h("span", { class: "i-path", title: i.path }, `‎${i.path}${i.source ? `  (from ${i.source})` : ""}`)),
-  );
-  if (f.items.length > 5) items.push(h("li", {}, h("span", { class: "i-size" }, ""), `and ${f.items.length - 5} more`));
-  row.append(
-    h(
-      "div",
-      { class: "f-body" },
-      h("p", { class: "f-why" }, f.why),
-      h("p", { class: "f-how" }, f.how),
-      f.prevent ? h("p", { class: "f-prevent" }, `To stop it coming back: ${f.prevent}`) : null,
-      items.length ? h("ul", { class: "items" }, items) : null,
-      h("p", { class: "f-meta" }, `${f.category_label} · ${f.action_label}`),
-      h(
-        "div",
-        { class: "actions" },
-        f.items.length ? h("button", { type: "button", class: "btn primary", onclick: () => showOnMap(f) }, "Show on map") : null,
-        f.can_trash
-          ? h("button", { type: "button", class: "btn", onclick: async () => showPlan(await invoke("plan_finding", { index: f.index })) }, f.items.length > 1 ? `Move ${f.items.length} items to Trash…` : "Move to Trash…")
-          : null,
-      ),
-    ),
-  );
-  return row;
-}
-
-async function showOnMap(f) {
-  state.highlight = f.index;
-  setMode("map");
-  await navigate(f.common_parent ?? state.summary.root);
-}
-
-function clearHighlight() {
-  if (state.highlight === null) return;
-  state.highlight = null;
-  renderBody();
-}
-
-function renderChip() {
-  const chip = $("chip");
-  const f = state.highlight !== null ? finding(state.highlight) : null;
-  chip.hidden = !f;
-  if (!f) return;
-  fill(
-    chip,
-    badge(f.safety),
-    h("span", {}, `Showing ${f.title}`),
-    h("button", { type: "button", "aria-label": "Stop showing this suggestion", onclick: clearHighlight }, "✕"),
-  );
-}
+// ── Selection panel ────────────────────────────────────────────────────────
 
 function renderSelected() {
   const pane = $("pane-selected");
-  const t = state.view?.tiles.find((x) => x.path && x.path === state.selected);
+  const v = state.view;
+  const t = v?.tiles.find((x) => x.path && x.path === state.selected);
   if (!t) {
-    fill(pane, h("p", { class: "empty" }, "Select something on the map to see what it is and what you can do with it."));
+    const here = v ? v.crumbs[v.crumbs.length - 1].name : "";
+    fill(
+      pane,
+      h("h2", { class: "sel-title" }, here === "/" ? "Disk" : here),
+      v ? h("p", { class: "sel-facts" }, `${bytes(v.bytes)} · ${v.files.toLocaleString()} files · ${v.dirs.toLocaleString()} folders`) : null,
+      h("p", { class: "empty" }, "Select something on the map to see what it is and what you can do with it."),
+    );
     return;
   }
   const facts = [bytes(t.bytes)];
   if (t.kind === "dir") facts.push(`${t.files.toLocaleString()} files`, `${t.dirs.toLocaleString()} folders`);
   facts.push(`changed ${ago(t.changed)}`);
   const f = t.finding !== null ? finding(t.finding) : null;
-  fill(pane, 
+  fill(
+    pane,
+    h("h2", { class: "sel-title" }, t.kind === "rest" ? "Smaller items" : t.name),
     h("p", { class: "sel-path" }, t.path),
     h("p", { class: "sel-facts" }, facts.join(" · ")),
     t.kind === "link" ? h("p", { class: "f-why" }, `A link to ${t.target}. What it points to is stored, and counted, there.`) : null,
@@ -558,8 +632,8 @@ function renderSelected() {
           "div",
           { class: "callout" },
           h("h3", {}, badge(f.safety), t.direct ? f.title : `Inside "${f.title}"`),
-          t.direct ? h("p", { class: "f-why" }, f.why) : null,
           h("p", { class: "f-how" }, f.how),
+          h("button", { type: "button", class: "link", onclick: () => backToSuggestion(f.index) }, "Read the whole suggestion"),
         )
       : t.cleanable
         ? h("div", { class: "callout" }, h("h3", {}, badge("safe"), `${bytes(t.cleanable)} cleanable inside`), h("p", { class: "f-why" }, "Open it to see where."))
@@ -584,29 +658,27 @@ function showPlan(plan) {
     $("dialog-title").textContent = plan.title;
     fill(body, h("p", {}, plan.body));
     fill(actions, h("button", { class: "btn primary", value: "ok" }, "OK"));
+    dialog.onclose = null;
     dialog.showModal();
     return;
   }
   $("dialog-title").textContent = plan.targets.length > 1 ? `Move ${plan.targets.length} items to the Trash?` : "Move to the Trash?";
-  fill(body, 
-    h(
-      "ul",
-      { class: "targets" },
-      plan.targets.map((t) => h("li", {}, h("span", { class: "i-size" }, bytes(t.bytes)), h("span", { class: "i-path" }, t.path))),
-    ),
+  fill(
+    body,
+    h("ul", { class: "targets" }, plan.targets.map((t) => h("li", {}, h("span", { class: "i-size" }, bytes(t.bytes)), h("span", { class: "i-path" }, t.path)))),
     h("p", {}, `${bytes(plan.total)} in total. You can take items back out of the Trash until it's emptied.`),
     plan.warning ? h("p", { class: "warning" }, plan.warning) : null,
   );
-  fill(actions, 
-    h("button", { class: "btn", value: "cancel" }, "Cancel"),
-    h("button", { class: "btn danger", value: "trash" }, "Move to Trash"),
-  );
+  fill(actions, h("button", { class: "btn", value: "cancel" }, "Cancel"), h("button", { class: "btn danger", value: "trash" }, "Move to Trash"));
   dialog.returnValue = "";
   dialog.onclose = async () => {
     if (dialog.returnValue !== "trash") return;
     const result = await invoke("trash", { paths: plan.targets.map((t) => t.path) });
     toast(result.failures.length ? `${result.message} ${result.failures.join("; ")}` : result.message);
     state.summary = await invoke("summary");
+    // The suggestion may be gone (all its items trashed): show the next one.
+    if (state.current === null || !finding(state.current)) state.current = firstInOrder();
+    if (state.highlight !== null && !finding(state.highlight)) state.highlight = null;
     renderDisk();
     renderSuggestions();
     await navigate(state.view.path);
@@ -617,7 +689,26 @@ function showPlan(plan) {
 // ── Keyboard ───────────────────────────────────────────────────────────────
 
 document.addEventListener("keydown", (e) => {
-  if ($("dialog").open || $("layout").hidden) return;
+  if ($("dialog").open || !$("scanning").hidden) return;
+  // ⌘1 / ⌘2 switch sections.
+  if (e.metaKey && (e.key === "1" || e.key === "2")) {
+    e.preventDefault();
+    setTab(e.key === "1" ? "suggestions" : "browse");
+    return;
+  }
+  if (state.tab === "suggestions") {
+    if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+      e.preventDefault();
+      const order = inOrder();
+      const i = order.indexOf(state.current);
+      const next = order[Math.max(0, Math.min(order.length - 1, i + (e.key === "ArrowDown" ? 1 : -1)))];
+      if (next !== undefined) {
+        showSuggestion(next);
+        document.querySelector(`.sg-row[data-index="${next}"]`)?.scrollIntoView({ block: "nearest" });
+      }
+    }
+    return;
+  }
   if (e.key === "Backspace" || (e.key === "Escape" && state.highlight === null)) {
     e.preventDefault();
     up();

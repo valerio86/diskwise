@@ -17,6 +17,10 @@
         </svg>
         <span>diskwise</span>
       </div>
+      <div class="seg main-tabs" role="tablist" aria-label="Sections" id="main-tabs" hidden>
+        <button role="tab" id="tab-suggestions" aria-selected="true" type="button">Suggestions</button>
+        <button role="tab" id="tab-browse" aria-selected="false" type="button">Browse</button>
+      </div>
       <div class="disk" id="disk" hidden>
         <div class="meter" role="img" id="disk-meter"><div class="meter-fill" id="disk-fill"></div></div>
         <div class="disk-text"><strong id="disk-pct"></strong> <span id="disk-free"></span></div>
@@ -24,7 +28,17 @@
       <button class="quiet" id="rescan" type="button" hidden>Scan again</button>
     </header>
 
-    <main class="layout" id="layout" hidden>
+    <!-- Suggestions: what to do. A list on the left, the whole suggestion on the right. -->
+    <main class="suggestions" id="view-suggestions" hidden>
+      <div class="totals" id="totals"></div>
+      <div class="sg-body">
+        <nav class="sg-list" id="sg-list" aria-label="Suggestions"></nav>
+        <article class="sg-detail" id="sg-detail" aria-live="polite"></article>
+      </div>
+    </main>
+
+    <!-- Browse: where space goes. The map, with a narrow panel explaining the selection. -->
+    <main class="layout" id="view-browse" hidden>
       <section class="map-pane" aria-label="Disk map">
         <div class="map-bar">
           <nav class="crumbs" id="crumbs" aria-label="Folder path"></nav>
@@ -46,14 +60,8 @@
           <p class="hint">Click to select, double-click a folder to open it, Backspace to go up.</p>
         </div>
       </section>
-
-      <aside class="side" aria-label="Details">
-        <div class="seg side-tabs" role="tablist">
-          <button role="tab" id="tab-suggestions" aria-selected="true" type="button">Suggestions</button>
-          <button role="tab" id="tab-selected" aria-selected="false" type="button">Selected</button>
-        </div>
-        <div id="pane-suggestions" class="pane"></div>
-        <div id="pane-selected" class="pane" hidden></div>
+      <aside class="side" aria-label="Selection">
+        <div id="pane-selected" class="pane"></div>
       </aside>
     </main>
 

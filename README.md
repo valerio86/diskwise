@@ -110,8 +110,15 @@ A treemap of the disk where only space a suggestion covers is coloured: blue
 safe to clean, amber safe after a step, pink your call. Untouched space stays
 grey, so the map lights up where you can reclaim space. Large folders show their
 contents in miniature, and miniatures fill from the bottom with the cleanable
-share deeper inside. The side panel lists suggestions (the default) or details
-of what's selected; "Show on map" dims everything except that suggestion's items.
+share deeper inside.
+
+Two sections, as in the TUI (⌘1 / ⌘2):
+- **Suggestions** (opens first): totals, then a list grouped by safety with bars
+  on one scale (only for space you can free), and the whole selected suggestion
+  beside it: what it is, what to do, how to stop it coming back, every path.
+- **Browse**: the map (or List view) with a narrow panel explaining the
+  selection. "Show on map" jumps here with that suggestion's items highlighted;
+  "Back to suggestion" in the chip jumps back.
 Moving to the Trash works as in the TUI (confirmation, refusals, verification),
 using the same core code. There's a List view with the same data as a table.
 

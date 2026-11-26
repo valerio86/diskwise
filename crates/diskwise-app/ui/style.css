@@ -71,7 +71,6 @@ button { font: inherit; color: inherit; }
 
 .top {
   display: flex;
-  justify-content: space-between;
   align-items: center;
   gap: 24px;
   padding: 12px 20px;
@@ -87,7 +86,7 @@ button { font: inherit; color: inherit; }
 .m-caution { fill: var(--caution); }
 .m-review { fill: var(--review); }
 
-.disk { margin-left: auto; margin-right: 16px; display: flex; align-items: center; gap: 12px; }
+.disk { margin-right: 16px; display: flex; align-items: center; gap: 12px; }
 .meter { width: 160px; height: 8px; border-radius: 4px; background: var(--track); overflow: hidden; }
 .meter-fill { height: 100%; background: var(--accent); border-radius: 4px; }
 .disk-text { color: var(--text-2); }
@@ -106,7 +105,7 @@ button { font: inherit; color: inherit; }
 
 .layout {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 380px;
+  grid-template-columns: minmax(0, 1fr) 300px;
   min-height: 0;
 }
 .map-pane {
@@ -167,6 +166,20 @@ button { font: inherit; color: inherit; }
 }
 .seg button[aria-selected="true"] { background: var(--accent); color: var(--on-accent); font-weight: 600; }
 .map-bar .seg { margin-left: auto; }
+/* Section tabs sit in the header, left-aligned after the name. */
+.main-tabs { margin-right: auto; -webkit-app-region: no-drag; }
+.main-tabs button { padding: 5px 16px; }
+.chip-title { overflow: hidden; text-overflow: ellipsis; max-width: 28ch; }
+.chip .chip-back {
+  width: auto;
+  height: auto;
+  border-radius: 6px;
+  padding: 2px 8px;
+  color: var(--accent);
+  font-weight: 600;
+}
+.chip .chip-x { margin-left: -2px; }
+.list .link-name { font-style: italic; color: var(--text-2); }
 
 /* ── Treemap ────────────────────────────────────────────────────────────── */
 
@@ -270,65 +283,126 @@ button { font: inherit; color: inherit; }
 .s-none { background: var(--tile-dir); }
 .hint { margin: 0 0 0 auto; }
 
-/* ── Side panel ─────────────────────────────────────────────────────────── */
+/* ── Suggestions section ────────────────────────────────────────────────── */
 
-.side {
-  background: var(--panel);
-  border-left: 1px solid var(--line);
+.suggestions {
   display: grid;
   grid-template-rows: auto 1fr;
   min-height: 0;
 }
-.side-tabs { margin: 14px 16px 6px; align-self: start; justify-self: start; }
-.pane { overflow: auto; padding: 8px 16px 24px; min-height: 0; }
-
-.totals { display: grid; gap: 6px; margin: 6px 0 18px; }
-.total { display: flex; align-items: baseline; gap: 8px; }
-.total .amount { font-size: 22px; font-weight: 650; letter-spacing: -0.02em; min-width: 98px; }
-.total .label { color: var(--text-2); }
-
-/* Safety dots. Never alone: a group heading, label or title always names the level. */
-.badge {
-  display: inline-block;
-  width: 10px;
-  height: 10px;
-  border-radius: 50%;
-  flex: none;
+.totals {
+  display: flex;
+  align-items: baseline;
+  gap: 40px;
+  padding: 20px 28px 18px;
+  border-bottom: 1px solid var(--line);
+  flex-wrap: wrap;
 }
+.total { display: grid; gap: 2px; }
+.total .amount { font-size: 26px; font-weight: 650; letter-spacing: -0.02em; }
+.total .label { color: var(--text-2); display: flex; align-items: center; gap: 7px; }
+.unreadable { margin: 0 0 0 auto; color: var(--text-2); font-size: 12px; max-width: 36ch; }
+
+.sg-body {
+  display: grid;
+  grid-template-columns: minmax(300px, 400px) minmax(0, 1fr);
+  min-height: 0;
+}
+.sg-list { overflow: auto; padding: 8px 12px 24px 16px; border-right: 1px solid var(--line); }
+.sg-group h2 {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-2);
+  margin: 16px 0 4px 10px;
+}
+.sg-row {
+  width: 100%;
+  display: grid;
+  grid-template-columns: 1fr auto;
+  grid-template-rows: auto 6px;
+  column-gap: 12px;
+  row-gap: 6px;
+  background: none;
+  border: 0;
+  border-radius: 8px;
+  padding: 8px 10px 9px;
+  text-align: left;
+  cursor: pointer;
+}
+.sg-row:hover { background: var(--panel-2); }
+.sg-row[aria-current="true"] { background: color-mix(in oklab, var(--accent) 20%, var(--panel)); }
+.sg-title { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.sg-size { color: var(--text-2); }
+/* One scale for every suggestion, so bar lengths compare across groups. */
+.sg-bar { grid-column: 1 / -1; height: 4px; border-radius: 2px; background: var(--panel-2); overflow: hidden; }
+.sg-row[aria-current="true"] .sg-bar { background: color-mix(in oklab, var(--panel) 70%, transparent); }
+.sg-fill { display: block; height: 100%; border-radius: 2px; }
+.sg-explains { grid-column: 1 / -1; color: var(--text-2); font-size: 11px; line-height: 4px; }
+
+.sg-detail { overflow: auto; padding: 28px 36px 40px; min-width: 0; }
+.sg-detail > * { max-width: 72ch; }
+.sd-head h1 { font-size: 22px; font-weight: 650; letter-spacing: -0.015em; margin: 6px 0 2px; }
+.sd-level { display: flex; align-items: center; gap: 8px; margin: 0; font-weight: 600; }
+.sd-meta { color: var(--text-2); font-weight: 400; margin-left: 6px; }
+.sd-size { color: var(--text-2); font-size: 15px; margin: 0 0 14px; }
+.sd-why { font-size: 14px; color: var(--text-2); margin: 0 0 18px; }
+.sd-block { margin: 0 0 18px; }
+.sd-block h2 { font-size: 13px; font-weight: 600; margin: 0 0 4px; }
+.sd-block p { margin: 0; }
+.sd-code {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 12px;
+  background: var(--panel-2);
+  border-radius: 7px;
+  padding: 8px 10px;
+  -webkit-user-select: text;
+  user-select: text;
+  word-break: break-word;
+}
+.sd-items { list-style: none; margin: 0; padding: 0; }
+.sd-items li { display: grid; grid-template-columns: 76px 1fr auto; gap: 12px; padding: 4px 0; border-bottom: 1px solid var(--line); }
+.sd-items .i-size { text-align: right; font-weight: 600; }
+.sd-items .i-path { word-break: break-all; -webkit-user-select: text; user-select: text; }
+.sd-items .i-source { color: var(--text-2); white-space: nowrap; }
+
+/* ── Selection panel (Browse) ───────────────────────────────────────────── */
+
+.side {
+  background: var(--panel);
+  border-left: 1px solid var(--line);
+  min-height: 0;
+  display: grid;
+}
+.pane { overflow: auto; padding: 18px 18px 24px; min-height: 0; }
+.sel-title { font-size: 16px; font-weight: 650; margin: 0 0 2px; word-break: break-all; }
+.sel-path { color: var(--text-2); font-size: 12px; word-break: break-all; margin: 0 0 6px; -webkit-user-select: text; user-select: text; }
+.sel-facts { color: var(--text-2); margin: 0 0 12px; }
+.callout { border-radius: 8px; padding: 10px 12px; background: var(--panel-2); margin: 10px 0; }
+.callout h3 { margin: 0 0 4px; font-size: 13px; display: flex; gap: 8px; align-items: center; }
+.callout p { margin: 4px 0 8px; }
+.f-how { color: var(--text); }
+.f-why, .f-meta { color: var(--text-2); }
+.empty { color: var(--text-2); padding: 12px 0; }
+.link {
+  background: none;
+  border: 0;
+  padding: 0;
+  color: var(--accent);
+  cursor: pointer;
+  font-weight: 600;
+}
+.link:hover { text-decoration: underline; }
+
+/* Safety dots. Never alone: a heading, label or title always names the level. */
+.badge { display: inline-block; width: 10px; height: 10px; border-radius: 50%; flex: none; }
 .b-safe { background: var(--safe); }
 .b-caution { background: var(--caution); }
 .b-review { background: var(--review); }
 
-.group { margin: 14px 0 4px; font-size: 12px; color: var(--text-2); font-weight: 600; }
-.finding { border-radius: 8px; }
-.finding > button {
-  width: 100%;
-  display: grid;
-  grid-template-columns: auto 74px 1fr;
-  align-items: center;
-  gap: 8px;
-  background: none;
-  border: 0;
-  padding: 7px 8px;
-  border-radius: 8px;
-  text-align: left;
-  cursor: pointer;
-}
-.finding > button:hover { background: var(--panel-2); }
-.finding[data-open="true"] { background: var(--panel-2); }
-.finding .f-size { text-align: right; color: var(--text-2); }
-.finding .f-title { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.f-body { padding: 0 10px 12px 34px; }
-.f-body p { margin: 6px 0; }
-.f-how { color: var(--text); }
-.f-why, .f-prevent { color: var(--text-2); }
-.f-meta { color: var(--text-2); font-size: 12px; }
-.items { list-style: none; margin: 8px 0; padding: 0; font-size: 12px; }
-.items li { display: flex; gap: 10px; padding: 2px 0; color: var(--text-2); }
-.items .i-size { min-width: 64px; text-align: right; color: var(--text); }
-.items .i-path { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; direction: rtl; text-align: left; }
-
-.actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+.actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 14px; }
 .btn {
   border: 0;
   border-radius: 7px;
@@ -340,13 +414,6 @@ button { font: inherit; color: inherit; }
 .btn:hover { background: var(--bg); }
 .btn.primary { background: var(--accent); color: var(--on-accent); box-shadow: none; font-weight: 600; }
 .btn.danger { background: var(--caution); color: var(--on-color); box-shadow: none; font-weight: 600; }
-.btn[disabled] { opacity: 0.5; cursor: not-allowed; }
-
-.sel-path { font-weight: 600; word-break: break-all; margin: 6px 0 2px; font-size: 14px; }
-.sel-facts { color: var(--text-2); margin: 0 0 12px; }
-.callout { border-radius: 8px; padding: 10px 12px; background: var(--panel-2); margin: 10px 0; }
-.callout h3 { margin: 0 0 4px; font-size: 13px; display: flex; gap: 8px; align-items: center; }
-.empty { color: var(--text-2); padding: 24px 4px; }
 
 /* ── Overlays ───────────────────────────────────────────────────────────── */
 

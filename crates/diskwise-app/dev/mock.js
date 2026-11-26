@@ -2,7 +2,8 @@
 // fixtures from a real snapshot (see write_preview_fixture in session.rs).
 // URL parameters drive the starting state for screenshots:
 //   ?path=/Users/x/Library   open a folder        &select=/Users/x/Library/Caches
-//   &finding=3               expand suggestion 3   &show=1  show it on the map
+//   &finding=3               show suggestion 3     &show=1  show it on the map
+//   &tab=browse              start in Browse
 //   &mode=list               list view             &trash=/path  open the trash dialog
 "use strict";
 (() => {
@@ -43,17 +44,14 @@
   window.addEventListener("load", () => {
     const q = new URLSearchParams(location.search);
     setTimeout(async () => {
+      if (q.get("finding")) showSuggestion(Number(q.get("finding")));
+      if (q.get("show")) await showOnMap(finding(Number(q.get("finding"))));
+      if (q.get("tab")) setTab(q.get("tab"));
       if (q.get("mode")) setMode(q.get("mode"));
       if (q.get("path")) await navigate(q.get("path"));
       if (q.get("select")) {
         const t = state.view.tiles.find((x) => x.path === q.get("select"));
         if (t) select(t);
-      }
-      if (q.get("finding")) {
-        const f = finding(Number(q.get("finding")));
-        state.open.add(f.index);
-        renderSuggestions();
-        if (q.get("show")) await showOnMap(f);
       }
       if (q.get("trash")) showPlan(await invoke("plan_path", { path: q.get("trash") }));
     }, 150);
