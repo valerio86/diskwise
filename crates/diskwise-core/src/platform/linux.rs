@@ -151,3 +151,46 @@ pub(crate) fn can_clone(path: &Path) -> bool {
     // f_type is signed and its width varies by architecture; the magic numbers are 32-bit.
     matches!(st.f_type as u32, BTRFS_SUPER_MAGIC | XFS_SUPER_MAGIC)
 }
+
+/// Make `dst` (which must not exist) a reflink clone of `src` (btrfs, XFS):
+/// same contents, sharing all storage until either is changed.
+pub(crate) fn clone_file(src: &Path, dst: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::io::AsRawFd;
+    let from = std::fs::File::open(src)?;
+    let to = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(dst)?;
+    let rc = unsafe { libc::ioctl(to.as_raw_fd(), libc::FICLONE as _, from.as_raw_fd()) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        let err = std::io::Error::last_os_error();
+        let _ = std::fs::remove_file(dst);
+        Err(err)
+    }
+}
+
+/// Linux has no user-settable file flags worth carrying over here.
+pub(crate) fn copy_flags(_from: &std::fs::Metadata, _to: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// Linux can't set a file's creation time.
+pub(crate) fn with_created(
+    times: std::fs::FileTimes,
+    _from: &std::fs::Metadata,
+) -> std::fs::FileTimes {
+    times
+}
+
+/// Where diskwise keeps settings: $XDG_CONFIG_HOME/diskwise or ~/.config/diskwise.
+pub(crate) fn config_dir() -> Option<std::path::PathBuf> {
+    if let Some(x) = std::env::var_os("XDG_CONFIG_HOME").filter(|x| Path::new(x).is_absolute()) {
+        return Some(Path::new(&x).join("diskwise"));
+    }
+    let home = std::env::var_os("HOME")?;
+    Some(Path::new(&home).join(".config/diskwise"))
+}

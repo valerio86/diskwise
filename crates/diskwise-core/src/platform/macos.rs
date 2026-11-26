@@ -168,3 +168,55 @@ pub(crate) fn can_clone(path: &Path) -> bool {
     let name = unsafe { std::ffi::CStr::from_ptr(st.f_fstypename.as_ptr()) };
     name.to_bytes() == b"apfs"
 }
+
+/// Make `dst` (which must not exist) an APFS clone of `src`: same contents,
+/// sharing all storage until either is changed.
+pub(crate) fn clone_file(src: &Path, dst: &Path) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = |p: &Path| {
+        std::ffi::CString::new(p.as_os_str().as_bytes())
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in path"))
+    };
+    let (s, d) = (c(src)?, c(dst)?);
+    const CLONE_NOFOLLOW: u32 = 0x0001;
+    if unsafe { libc::clonefile(s.as_ptr(), d.as_ptr(), CLONE_NOFOLLOW) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// macOS file flags (hidden, locked, …), set last since "locked" blocks changes.
+pub(crate) fn copy_flags(from: &std::fs::Metadata, to: &Path) -> std::io::Result<()> {
+    use std::os::darwin::fs::MetadataExt;
+    use std::os::unix::ffi::OsStrExt;
+    let flags = from.st_flags();
+    if flags == 0 {
+        return Ok(());
+    }
+    let p = std::ffi::CString::new(to.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in path"))?;
+    if unsafe { libc::lchflags(p.as_ptr(), flags) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// Also carry over the creation date.
+pub(crate) fn with_created(
+    times: std::fs::FileTimes,
+    from: &std::fs::Metadata,
+) -> std::fs::FileTimes {
+    use std::os::darwin::fs::FileTimesExt;
+    match from.created() {
+        Ok(t) => times.set_created(t),
+        Err(_) => times,
+    }
+}
+
+/// Where diskwise keeps settings: ~/Library/Application Support/diskwise.
+pub(crate) fn config_dir() -> Option<std::path::PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    Some(Path::new(&home).join("Library/Application Support/diskwise"))
+}

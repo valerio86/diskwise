@@ -787,6 +787,7 @@ mod test_support {
             skipped_mounts: vec![],
             system: None,
             large_files: vec![],
+            synced_roots: vec![],
         };
         let findings = vec![
             finding(

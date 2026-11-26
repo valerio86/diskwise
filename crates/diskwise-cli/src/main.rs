@@ -113,9 +113,10 @@ enum Command {
         #[arg(long)]
         no_cache: bool,
         /// When location and names don't decide which copy to keep: the
-        /// original (oldest) or the newest copy.
-        #[arg(long, value_enum, default_value = "original")]
-        prefer: PreferArg,
+        /// original (oldest) or the newest copy (default: as saved in the
+        /// apps' preferences, else original).
+        #[arg(long, value_enum)]
+        prefer: Option<PreferArg>,
     },
     /// List the rules in effect.
     Rules {
@@ -264,11 +265,17 @@ fn main() -> Result<()> {
                 "Comparing {} files of 1 MB or more …",
                 snap.large_files.len()
             );
-            let prefer = match prefer {
+            let prefer = prefer.map(|p| match p {
                 PreferArg::Original => diskwise_core::dupes::Prefer::Original,
                 PreferArg::Newest => diskwise_core::dupes::Prefer::NewestCopy,
-            };
-            let report = diskwise_core::dupes::find(&snap, cache.as_deref(), None, prefer);
+            });
+            let mut prefs = diskwise_core::dupes::Prefs::default_path()
+                .map(|p| diskwise_core::dupes::Prefs::load(&p))
+                .unwrap_or_default();
+            if let Some(prefer) = prefer {
+                prefs.prefer = prefer;
+            }
+            let report = diskwise_core::dupes::find(&snap, cache.as_deref(), None, &prefs);
             if json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
@@ -324,6 +331,7 @@ fn print_dupes(r: &diskwise_core::dupes::Report, top: usize) {
         (_, Some(Action::Trash)) => "trash",
         (_, Some(Action::StoreOnce)) => "store once",
         (_, Some(Action::Review)) => "review",
+        (_, Some(Action::Keep)) => "kept",
         (_, Some(Action::Nothing) | None) => "",
     };
     if r.groups.is_empty() && r.folders.is_empty() {

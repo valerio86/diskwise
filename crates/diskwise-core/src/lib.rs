@@ -35,6 +35,7 @@ pub fn snapshot(root: &Path, opts: ScanOptions, with_system: bool) -> std::io::R
         errors,
         skipped_mounts,
         large_files,
+        synced_roots,
     } = scan::scan(root, opts)?;
     let system = with_system.then(|| system::probe(&root.display().to_string()));
     // Kernel and in-memory filesystems (/proc, /dev, /run, …) don't count as "not
@@ -58,6 +59,7 @@ pub fn snapshot(root: &Path, opts: ScanOptions, with_system: bool) -> std::io::R
         skipped_mounts,
         system,
         large_files,
+        synced_roots,
     })
 }
 

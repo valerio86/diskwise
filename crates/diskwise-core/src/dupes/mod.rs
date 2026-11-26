@@ -33,8 +33,28 @@ use crate::model::{LargeFile, Snapshot};
 /// Smaller files rarely add up to much, and there are far more of them.
 pub const DEFAULT_MIN_SIZE: u64 = 1 << 20;
 
+pub mod act;
 mod folders;
+pub mod prefs;
 pub use folders::FolderGroup;
+pub use prefs::Prefs;
+
+/// Files that mark a folder as kept in sync by a service: Dropbox, Syncthing,
+/// ownCloud/Nextcloud. Names, not folder names like "Dropbox", which can be
+/// plain folders (or old exports).
+pub(crate) fn is_sync_marker(name: &str) -> bool {
+    matches!(
+        name,
+        ".dropbox" | ".stfolder" | ".owncloudsync.log" | ".nextcloudsync.log"
+    ) || ((name.starts_with(".sync_") || name.starts_with("._sync_")) && name.ends_with(".db"))
+}
+
+/// What `rank` needs to know besides the copies themselves.
+pub(crate) struct Ctx<'a> {
+    pub prefs: &'a Prefs,
+    pub home_base: &'a str,
+    pub synced: &'a [String],
+}
 
 /// Folders whose files belong to an app or tool, wherever they appear. Deleting
 /// one "duplicate" inside them breaks the thing that owns it, and the rules
@@ -154,6 +174,9 @@ pub struct Copy {
     /// What to do with this copy; `None` for the one to keep.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub action: Option<Action>,
+    /// Inside a synced folder: deleting it deletes it everywhere.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub synced: bool,
 }
 
 /// What diskwise suggests for an extra copy.
@@ -172,6 +195,9 @@ pub enum Action {
     Review,
     /// Already shares its storage with the keeper (hard link or clone): nothing to gain.
     Nothing,
+    /// The user chose to keep it as it is (that copy, or a folder of
+    /// intentional duplicates).
+    Keep,
 }
 
 /// Which copy to keep when nothing else (location, name) decides.
@@ -217,6 +243,11 @@ pub struct Report {
     pub groups: Vec<Group>,
     /// Duplicates whose copies already share storage, so deleting frees nothing.
     pub already_shared: Vec<Group>,
+    /// Duplicates the user chose to keep as they are (every extra copy kept).
+    #[serde(default)]
+    pub kept: Vec<Group>,
+    #[serde(default)]
+    pub kept_folders: Vec<FolderGroup>,
     pub candidates: u64,
     /// Bytes read this run. Cached files still have their first and last 64 KiB
     /// read (to compare them with uncached ones), never the whole file.
@@ -249,7 +280,7 @@ pub fn find(
     snap: &Snapshot,
     cache: Option<&Path>,
     progress: Option<Arc<DupeProgress>>,
-    prefer: Prefer,
+    prefs: &Prefs,
 ) -> Report {
     let mut report = Report {
         candidates: snap.large_files.len() as u64,
@@ -373,7 +404,14 @@ pub fn find(
         cached.save(path);
     }
 
-    report.folders = folders::find(snap, &by_hash, prefer, &protection);
+    let ctx = Ctx {
+        prefs,
+        home_base: snap.platform().home_base,
+        synced: &snap.synced_roots,
+    };
+    let (folders, kept_folders) = folders::find(snap, &by_hash, &ctx, &protection);
+    report.folders = folders;
+    report.kept_folders = kept_folders;
     // Files inside an extra folder copy are covered by that folder, and files
     // inside a kept folder are kept (so the two never contradict each other).
     let kept: Vec<&str> = report
@@ -395,9 +433,14 @@ pub fn find(
             continue;
         }
         let keep_first = |p: &str| kept.iter().any(|k| inside(p, k));
-        let group = build_group(hash, copies, prefer, snap.platform().home_base, &keep_first);
+        let group = build_group(hash, copies, &ctx, &keep_first);
         if group.reclaimable > 0 {
             report.groups.push(group);
+        } else if group.copies[1..]
+            .iter()
+            .any(|c| c.action == Some(Action::Keep))
+        {
+            report.kept.push(group);
         } else {
             report.already_shared.push(group);
         }
@@ -435,8 +478,7 @@ where
 fn build_group(
     hash: String,
     live: Vec<Live>,
-    prefer: Prefer,
-    home_base: &str,
+    ctx: &Ctx,
     keep_first: &dyn Fn(&str) -> bool,
 ) -> Group {
     let size = live[0].file.size;
@@ -460,14 +502,15 @@ fn build_group(
                 created: l.file.created,
                 shared,
                 action: None,
+                synced: false,
             };
             (copy, l.file.dev, l.can_clone)
         })
         .collect();
-    let copies = rank(copies, prefer, home_base, keep_first);
+    let copies = rank(copies, ctx, keep_first);
     // Other names of a hard-linked file already count as freeing nothing (and
     // deleting every name of one would free it once: underestimated, never over).
-    let reclaimable = copies[1..].iter().map(|c| c.frees).sum();
+    let reclaimable = reclaimable(&copies);
     Group {
         size,
         hash,
@@ -485,10 +528,23 @@ fn build_group(
 /// frees space, the other way round frees nothing); then `keep_order`.
 fn rank(
     mut copies: Vec<(Copy, u64, bool)>,
-    prefer: Prefer,
-    home_base: &str,
+    ctx: &Ctx,
     keep_first: &dyn Fn(&str) -> bool,
 ) -> Vec<Copy> {
+    let (prefer, home_base) = (ctx.prefs.prefer, ctx.home_base);
+    // The user's "prefer folder A over B" choices, as a score per copy.
+    let paths: Vec<String> = copies.iter().map(|(c, _, _)| c.path.clone()).collect();
+    let score: HashMap<String, i32> = paths
+        .iter()
+        .map(|p| {
+            let others: Vec<&str> = paths
+                .iter()
+                .filter(|o| *o != p)
+                .map(|o| o.as_str())
+                .collect();
+            (p.clone(), ctx.prefs.order_score(p, &others))
+        })
+        .collect();
     // A copy named like another one plus a marker ("a-1" next to "a") is never
     // the keeper while the plain name is there.
     let marked: HashSet<String> = copies
@@ -504,6 +560,7 @@ fn rank(
     copies.sort_by(|a, b| {
         keep_first(&b.0.path)
             .cmp(&keep_first(&a.0.path))
+            .then_with(|| score[&b.0.path].cmp(&score[&a.0.path]))
             .then_with(|| marked.contains(&a.0.path).cmp(&marked.contains(&b.0.path)))
             .then_with(|| shared(&b.0).cmp(&shared(&a.0)))
             .then_with(|| keep_order(&a.0, &b.0, prefer))
@@ -512,8 +569,17 @@ fn rank(
     let (keeper_path, keeper_dev) = (keeper.path.clone(), *keeper_dev);
     let keeper_in_downloads = in_downloads(&keeper_path, home_base);
     for (c, dev, can_clone) in &mut copies[1..] {
+        c.synced = ctx
+            .synced
+            .iter()
+            .any(|s| c.path == *s || inside(&c.path, s));
         c.action = Some(if c.frees == 0 {
             Action::Nothing
+        } else if ctx.prefs.is_kept(&c.path) {
+            Action::Keep
+        } else if c.synced {
+            // Deleting or replacing it would reach every synced device.
+            Action::Review
         } else if is_named_copy(&keeper_path, &c.path)
             || (in_downloads(&c.path, home_base) && !keeper_in_downloads)
         {
@@ -527,6 +593,15 @@ fn rank(
         });
     }
     copies.into_iter().map(|(c, _, _)| c).collect()
+}
+
+/// Space freed by acting on every extra copy that isn't kept as it is.
+pub(crate) fn reclaimable(copies: &[Copy]) -> u64 {
+    copies[1..]
+        .iter()
+        .filter(|c| c.action != Some(Action::Keep))
+        .map(|c| c.frees)
+        .sum()
 }
 
 /// Which copy to keep: the one in the most deliberate place, then the original
@@ -838,7 +913,7 @@ mod tests {
         let snap = scan(&d);
         assert_eq!(snap.large_files.len(), 4, "{:?}", snap.large_files);
         let cache = d.join("cache/hashes.json");
-        let r = find(&snap, Some(&cache), None, Prefer::Original);
+        let r = find(&snap, Some(&cache), None, &Prefs::default());
         assert_eq!(r.groups.len(), 1);
         let g = &r.groups[0];
         assert_eq!(g.copies.len(), 3);
@@ -850,7 +925,7 @@ mod tests {
         assert!(g.reclaimable >= 2 * (2 << 20));
 
         // Second run is served from the cache.
-        let r2 = find(&snap, Some(&cache), None, Prefer::Original);
+        let r2 = find(&snap, Some(&cache), None, &Prefs::default());
         assert_eq!(r2.groups.len(), 1);
         assert!(
             r2.read_bytes < r.read_bytes,
@@ -868,7 +943,7 @@ mod tests {
         write(&d.join("one.bin"), &a);
         std::fs::hard_link(d.join("one.bin"), d.join("two.bin")).unwrap();
         let snap = scan(&d);
-        let r = find(&snap, None, None, Prefer::Original);
+        let r = find(&snap, None, None, &Prefs::default());
         assert!(r.groups.is_empty(), "{:?}", r.groups);
         assert_eq!(r.already_shared.len(), 1);
         std::fs::remove_dir_all(&d).unwrap();
@@ -892,7 +967,7 @@ mod tests {
         assert_eq!(private_size(&d.join("two.bin")), Some(0));
         write(&d.join("three.bin"), &content(5, 2 << 20));
         assert!(private_size(&d.join("three.bin")).unwrap() >= 2 << 20);
-        let r = find(&scan(&d), None, None, Prefer::Original);
+        let r = find(&scan(&d), None, None, &Prefs::default());
         // three.bin is a real copy, so one copy's worth is reclaimable; the clone frees nothing.
         assert_eq!(r.groups.len(), 1, "{:?}", r);
         let g = &r.groups[0];
@@ -914,7 +989,7 @@ mod tests {
         write(&d.join("y/a"), &a);
         let snap = scan(&d);
         std::fs::remove_file(d.join("y/a")).unwrap();
-        let r = find(&snap, None, None, Prefer::Original);
+        let r = find(&snap, None, None, &Prefs::default());
         assert_eq!(r.changed, 1);
         assert!(r.groups.is_empty());
         std::fs::remove_dir_all(&d).unwrap();
@@ -993,6 +1068,79 @@ mod tests {
         assert!(!collect_at_root("/", &l));
     }
 
+    fn newest() -> Prefs {
+        Prefs {
+            prefer: Prefer::NewestCopy,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn preferences_and_synced_folders() {
+        let d = dir("prefs");
+        let a = content(11, 2 << 20);
+        write(&d.join("Projects/site/a.jpg"), &a);
+        write(&d.join("Projects/site/web/a.jpg"), &a);
+        write(&d.join("Archive/a.jpg"), &a);
+        let b = content(12, 2 << 20);
+        write(&d.join("Shared/b.bin"), &b);
+        write(&d.join("Shared/.dropbox"), b"");
+        write(&d.join("Mine/b.bin"), &b);
+        let snap = scan(&d);
+        let p = |s: &str| d.join(s).display().to_string();
+        assert_eq!(snap.synced_roots, vec![p("Shared")]);
+
+        // Mine/b.bin wins on path length (same age and location), so the
+        // synced copy is the extra one, and it's never preselected.
+        let r = find(&snap, None, None, &Prefs::default());
+        let g = r
+            .groups
+            .iter()
+            .find(|g| g.copies.iter().any(|c| c.path.ends_with("b.bin")))
+            .unwrap();
+        assert_eq!(g.copies[0].path, p("Mine/b.bin"));
+        assert_eq!(g.copies[1].action, Some(Action::Review));
+        assert!(g.copies[1].synced);
+
+        // "Prefer Archive over Projects" makes Archive's copy the keeper.
+        let mut prefs = Prefs::default();
+        prefs.add_folder_order(&p("Archive"), &p("Projects"));
+        let r = find(&snap, None, None, &prefs);
+        let g = r
+            .groups
+            .iter()
+            .find(|g| g.copies.iter().any(|c| c.path.ends_with("a.jpg")))
+            .unwrap();
+        assert_eq!(g.copies[0].path, p("Archive/a.jpg"));
+
+        // Intentional duplicates in Projects: both extra copies there are kept,
+        // so the group moves to `kept` and frees nothing.
+        prefs.set_intentional(&p("Projects"), true);
+        let r = find(&snap, None, None, &prefs);
+        assert!(
+            r.groups
+                .iter()
+                .all(|g| !g.copies.iter().any(|c| c.path.ends_with("a.jpg")))
+        );
+        let k = r
+            .kept
+            .iter()
+            .find(|g| g.copies[0].path == p("Archive/a.jpg"))
+            .unwrap();
+        assert!(k.copies[1..].iter().all(|c| c.action == Some(Action::Keep)));
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn sync_markers() {
+        assert!(is_sync_marker(".dropbox"));
+        assert!(is_sync_marker(".stfolder"));
+        assert!(is_sync_marker(".sync_a1b2c3.db"));
+        assert!(is_sync_marker("._sync_a1b2c3.db"));
+        assert!(!is_sync_marker("Dropbox"));
+        assert!(!is_sync_marker(".sync"));
+    }
+
     #[test]
     fn named_copies() {
         let yes = [
@@ -1035,7 +1183,7 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(1100));
         write(&d.join("Projects/survey/a.jpg"), &a);
         let snap = scan(&d);
-        let r = find(&snap, None, None, Prefer::Original);
+        let r = find(&snap, None, None, &Prefs::default());
         let g = &r.groups[0];
         let action = |suffix: &str| {
             g.copies
@@ -1059,7 +1207,7 @@ mod tests {
         assert_eq!(action("/Projects/survey/a.jpg"), Some(in_doubt));
 
         // Preferring the newest copy flips the choice between the two plain names.
-        let newest = find(&snap, None, None, Prefer::NewestCopy);
+        let newest = find(&snap, None, None, &newest());
         let keeper = &newest.groups[0].copies[0].path;
         if snap.large_files.iter().all(|f| f.created > 0) {
             assert!(keeper.ends_with("/Projects/survey/a.jpg"), "{keeper}");
@@ -1081,7 +1229,7 @@ mod tests {
         // Newer, but named as a copy of the other: never the keeper.
         write(&d.join("Movies/clip2-1.mp4"), &b);
         let snap = scan(&d);
-        let r = find(&snap, None, None, Prefer::NewestCopy);
+        let r = find(&snap, None, None, &newest());
         let clip = r
             .groups
             .iter()
@@ -1129,8 +1277,11 @@ mod tests {
                 mk("/Users/v/Documents/FLC/IMG_1.MOV"),
                 mk("/Users/v/Development/site/web/IMG_1.MOV"),
             ],
-            Prefer::Original,
-            "/Users",
+            &Ctx {
+                prefs: &Prefs::default(),
+                home_base: "/Users",
+                synced: &[],
+            },
             &|_| false,
         );
         assert_eq!(g.copies[0].path, "/Users/v/Documents/FLC/IMG_1.MOV");
@@ -1151,8 +1302,11 @@ mod tests {
                 mk("/Users/v/Downloads/a/x.MOV"),
                 mk("/Users/v/Downloads/b/x.MOV"),
             ],
-            Prefer::Original,
-            "/Users",
+            &Ctx {
+                prefs: &Prefs::default(),
+                home_base: "/Users",
+                synced: &[],
+            },
             &|_| false,
         );
         assert_eq!(g.copies[1].action, Some(Action::StoreOnce));
@@ -1185,8 +1339,11 @@ mod tests {
                 mk("/Users/v/A2/x", 7, 2, 200),
                 mk("/Users/v/B/x", 8, 1, 100),
             ],
-            Prefer::Original,
-            "/Users",
+            &Ctx {
+                prefs: &Prefs::default(),
+                home_base: "/Users",
+                synced: &[],
+            },
             &|_| false,
         );
         assert_ne!(g.copies[0].path, "/Users/v/B/x", "{:?}", g.copies);

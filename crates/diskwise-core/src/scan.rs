@@ -54,6 +54,7 @@ struct Ctx {
     skipped_mounts: Mutex<Vec<String>>,
     protection: Protection,
     large_files: Mutex<Vec<LargeFile>>,
+    synced_roots: Mutex<Vec<String>>,
 }
 
 /// What one scan found.
@@ -64,6 +65,8 @@ pub struct ScanOutput {
     pub skipped_mounts: Vec<String>,
     /// Possible duplicates (see `Snapshot::large_files`), sorted by path.
     pub large_files: Vec<LargeFile>,
+    /// Folders with a sync service's marker file (see `Snapshot::synced_roots`).
+    pub synced_roots: Vec<String>,
 }
 
 impl Ctx {
@@ -105,6 +108,7 @@ pub fn scan(root: &Path, opts: ScanOptions) -> std::io::Result<ScanOutput> {
         skipped_mounts: Mutex::new(Vec::new()),
         protection: Protection::for_platform(crate::platform::CURRENT),
         large_files: Mutex::new(Vec::new()),
+        synced_roots: Mutex::new(Vec::new()),
     };
     let display = crate::platform::CURRENT.display_path(&root.display().to_string());
     let collect =
@@ -125,11 +129,14 @@ pub fn scan(root: &Path, opts: ScanOptions) -> std::io::Result<ScanOutput> {
     skipped_mounts.sort();
     let mut large_files = ctx.large_files.into_inner().unwrap();
     dupes::keep_size_collisions(&mut large_files);
+    let mut synced_roots = ctx.synced_roots.into_inner().unwrap();
+    synced_roots.sort();
     Ok(ScanOutput {
         tree,
         errors,
         skipped_mounts,
         large_files,
+        synced_roots,
     })
 }
 
@@ -179,6 +186,9 @@ fn scan_dir(
             }
         };
         let child_name = entry.file_name().to_string_lossy().into_owned();
+        if dupes::is_sync_marker(&child_name) {
+            ctx.synced_roots.lock().unwrap().push(display.to_string());
+        }
         // Not valid UTF-8: `child_name` is an approximation, never to act on.
         let lossy = entry.file_name().to_str().is_none();
 

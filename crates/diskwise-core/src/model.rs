@@ -92,6 +92,11 @@ pub struct Snapshot {
     /// Input for `dupes::find`; empty in snapshots older than version 5.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub large_files: Vec<LargeFile>,
+    /// Folders kept in sync with a cloud or other devices (Dropbox, Syncthing,
+    /// Nextcloud…), found by their marker files. Deleting there deletes
+    /// everywhere, so duplicates inside are never preselected for action.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub synced_roots: Vec<String>,
 }
 
 /// One file the scan noted as a possible duplicate (see `Snapshot::large_files`).

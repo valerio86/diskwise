@@ -412,6 +412,7 @@ mod tests {
             skipped_mounts: vec![],
             system: None,
             large_files: vec![],
+            synced_roots: vec![],
         }
     }
 

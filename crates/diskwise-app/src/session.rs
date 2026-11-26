@@ -680,6 +680,7 @@ mod tests {
             skipped_mounts: vec![],
             system: None,
             large_files: vec![],
+            synced_roots: vec![],
         };
         // A snapshot from another OS: fine for viewing, never live.
         Session::new(
@@ -763,6 +764,7 @@ mod tests {
             skipped_mounts: vec![],
             system: None,
             large_files: vec![],
+            synced_roots: vec![],
         };
         let rules = format!(
             r#"

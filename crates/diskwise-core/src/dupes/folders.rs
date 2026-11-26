@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use super::{Copy, Live, Prefer, full_hash, inside, private_size, rank};
+use super::{Action, Copy, Ctx, Live, full_hash, inside, private_size, rank, reclaimable};
 use crate::actions::Protection;
 use crate::model::{NodeKind, Snapshot};
 
@@ -48,14 +48,14 @@ pub struct FolderGroup {
 }
 
 /// What a walk of one folder found, keyed by path relative to it.
-enum Entry {
+pub(super) enum Entry {
     Dir,
     File { size: u64, real: PathBuf },
     Link(PathBuf),
 }
 
 /// Totals of one verified copy.
-struct Summary {
+pub(super) struct Summary {
     files: u64,
     size: u64,
     allocated: u64,
@@ -65,9 +65,9 @@ struct Summary {
 pub(super) fn find(
     snap: &Snapshot,
     by_hash: &HashMap<String, Vec<Live>>,
-    prefer: Prefer,
+    ctx: &Ctx,
     protection: &Protection,
-) -> Vec<FolderGroup> {
+) -> (Vec<FolderGroup>, Vec<FolderGroup>) {
     let root = snap.display_root();
     let known: HashMap<&str, &str> = by_hash
         .iter()
@@ -135,9 +135,9 @@ pub(super) fn find(
     }
     groups.sort_by_key(|g| g.iter().map(|p| depth(p)).min());
 
-    let home_base = snap.platform().home_base;
     let mut extras: Vec<String> = Vec::new();
     let mut kept: Vec<String> = Vec::new();
+    let mut kept_out = Vec::new();
     let mut out = Vec::new();
     for members in groups {
         // A folder inside an extra copy found earlier is already covered.
@@ -162,6 +162,7 @@ pub(super) fn find(
                     created: crate::scan::birth_time(&meta),
                     shared: None,
                     action: None,
+                    synced: false,
                 };
                 Some((copy, meta.dev(), crate::platform::can_clone(&real)))
             })
@@ -173,9 +174,17 @@ pub(super) fn find(
         let (size, files) = (first.size, first.files);
         // A subfolder of a folder that is being kept is the one to keep here too.
         let keep_first = |p: &str| kept.iter().any(|k| inside(p, k));
-        let copies = rank(entries, prefer, home_base, &keep_first);
-        let reclaimable: u64 = copies[1..].iter().map(|c| c.frees).sum();
+        let copies = rank(entries, ctx, &keep_first);
+        let reclaimable = reclaimable(&copies);
         if reclaimable == 0 {
+            if copies[1..].iter().any(|c| c.action == Some(Action::Keep)) {
+                kept_out.push(FolderGroup {
+                    size,
+                    files,
+                    copies,
+                    reclaimable,
+                });
+            }
             continue;
         }
         extras.extend(copies[1..].iter().map(|c| c.path.clone()));
@@ -192,7 +201,7 @@ pub(super) fn find(
             .cmp(&a.reclaimable)
             .then(a.copies[0].path.cmp(&b.copies[0].path))
     });
-    out
+    (out, kept_out)
 }
 
 /// Step up from two identical files, recording each pair of folders whose
@@ -256,7 +265,7 @@ fn totals_match(snap: &Snapshot, a: &str, b: &str) -> bool {
 }
 
 /// Compare two folders entry by entry; the totals of each if identical.
-fn verify(
+pub(super) fn verify(
     snap: &Snapshot,
     a: &str,
     b: &str,
@@ -326,7 +335,7 @@ fn add(s: &mut Summary, real: &Path, size: u64) -> Option<()> {
 
 /// Every entry under `root`, by relative path. `None` if any can't be read or
 /// named exactly (then the folders can't be compared or acted on safely).
-fn walk(root: &Path) -> Option<BTreeMap<String, Entry>> {
+pub(super) fn walk(root: &Path) -> Option<BTreeMap<String, Entry>> {
     let mut out = BTreeMap::new();
     let mut stack = vec![(root.to_path_buf(), String::new())];
     while let Some((dir, rel)) = stack.pop() {
@@ -422,7 +431,7 @@ mod tests {
         // A loose duplicate elsewhere is still a file-level duplicate.
         write(&d.join("Misc/a.mov"), &content(1, 2 << 20));
 
-        let r = find_dupes(&scan(&d), None, None, Prefer::Original);
+        let r = find_dupes(&scan(&d), None, None, &super::super::Prefs::default());
         assert_eq!(r.folders.len(), 1, "{:?}", r.folders);
         let g = &r.folders[0];
         assert_eq!(g.files, 4);
@@ -456,7 +465,7 @@ mod tests {
         let d = dir("differ");
         project(&d.join("A/FLC"), b"hello");
         project(&d.join("B/FLC"), b"hellp");
-        let r = find_dupes(&scan(&d), None, None, Prefer::Original);
+        let r = find_dupes(&scan(&d), None, None, &super::super::Prefs::default());
         // The top folders differ (note.txt), but their photos subfolders don't.
         let tops: Vec<&str> = r
             .folders
@@ -474,7 +483,7 @@ mod tests {
         project(&d.join("Documents/FLC"), b"x");
         project(&d.join("Archive/FLC"), b"x");
         project(&d.join("Documents/FLC copy"), b"x");
-        let r = find_dupes(&scan(&d), None, None, Prefer::Original);
+        let r = find_dupes(&scan(&d), None, None, &super::super::Prefs::default());
         assert_eq!(r.folders.len(), 1, "{:?}", r.folders);
         let g = &r.folders[0];
         assert_eq!(g.copies.len(), 3, "{:?}", g.copies);
@@ -516,7 +525,7 @@ mod tests {
         project(&d.join("Documents/FLC"), b"n");
         write(&d.join("Documents/other.txt"), b"only here");
         project(&d.join("Old/FLC"), b"n");
-        let r = find_dupes(&scan(&d), None, None, Prefer::Original);
+        let r = find_dupes(&scan(&d), None, None, &super::super::Prefs::default());
         assert!(
             r.folders[0].copies[0].path.ends_with("/Documents/FLC"),
             "{:?}",
