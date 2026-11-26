@@ -1,6 +1,7 @@
 //! diskwise core: scan a disk into a size tree, collect storage facts the walk
 //! can't see, and turn both into cleanup suggestions. Supports macOS and Linux.
 
+pub mod actions;
 pub mod model;
 pub mod platform;
 pub mod provenance;

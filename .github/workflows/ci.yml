@@ -29,3 +29,18 @@ jobs:
       # A real scan of the runner's disk, as a smoke test of the probes.
       - run: cargo run --release -q -- scan --depth 1
       - run: cargo run --release -q -- suggest --compact
+
+  # The desktop app (Tauri) is outside the default members; build it on macOS,
+  # where the webview comes with the OS.
+  app:
+    name: desktop app (macos-latest)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy -p diskwise-app --all-targets
+      - run: cargo test -p diskwise-app
+      - run: node --check crates/diskwise-app/ui/app.js

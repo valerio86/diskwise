@@ -1,6 +1,9 @@
 [workspace]
 resolver = "3"
 members = ["crates/*"]
+# Plain `cargo build/test/clippy` skip the desktop app, which needs a webview
+# toolkit (WebKitGTK on Linux). Build it with `cargo build -p diskwise-app`.
+default-members = ["crates/diskwise-core", "crates/diskwise-cli"]
 
 [workspace.package]
 version = "0.1.0"

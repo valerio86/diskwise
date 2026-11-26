@@ -11,7 +11,7 @@ safe ways to reclaim it.
 | 1 | Scanner CLI + JSON snapshot + macOS probes (APFS volumes, snapshots, swap) | ✅ |
 | 2 | Rules engine + `suggest`: caches, regenerable data, app-managed data, your data, system space | ✅ |
 | 3a | Terminal UI (`diskwise tui`): browse, suggestions, move to Trash with verification | ✅ |
-| 3b | Tauri desktop app: treemap, same core | ⏳ |
+| 3b | Desktop app (Tauri): treemap, suggestions, move to Trash | ✅ first version |
 | 4 | Optional local LLM to explain unrecognised folders | ⏳ |
 
 ## Usage
@@ -98,6 +98,34 @@ CI runs the tests on Ubuntu and macOS. Windows is not supported.
 
 Known limitation: APFS clones (copy-on-write copies) are counted at full size.
 
+## Desktop app
+
+```sh
+cargo run -p diskwise-app                       # scan the whole disk
+cargo run -p diskwise-app -- ~/Library          # one folder
+cargo run -p diskwise-app -- --from disk.snapshot.json
+```
+
+A treemap of the disk where only space a suggestion covers is coloured: blue
+safe to clean, amber safe after a step, pink your call. Untouched space stays
+grey, so the map lights up where you can reclaim space. Large folders show their
+contents in miniature, and miniatures fill from the bottom with the cleanable
+share deeper inside. The side panel lists suggestions (the default) or details
+of what's selected; "Show on map" dims everything except that suggestion's items.
+Moving to the Trash works as in the TUI (confirmation, refusals, verification),
+using the same core code. There's a List view with the same data as a table.
+
+The safety colours were checked with a colour-vision-deficiency validator in both
+light and dark mode (the obvious green/amber pair fails for protanopia, so safe
+is blue). The app follows the system light/dark setting.
+
+Run from a terminal, the app inherits the terminal's Full Disk Access. A bundled
+`.app` needs its own entry in System Settings → Privacy & Security → Full Disk Access.
+
+To check the UI without running the app, `crates/diskwise-app/dev/preview.sh`
+screenshots the real `ui/` in headless Chrome against fixtures made from a
+snapshot (the fixtures hold real paths and are git-ignored).
+
 ## Suggestions
 
 `diskwise suggest` groups what it finds by how safe it is to act on:
@@ -140,4 +168,8 @@ the same `id` as a built-in one replaces it.
 - `crates/diskwise-cli` — `diskwise` command-line tool and TUI (`src/tui/`:
   `app.rs` state and behaviour, unit-tested without a terminal; `ui.rs` drawing,
   tested by rendering to a text buffer; `theme.rs` colour detection)
+- `crates/diskwise-app` — Tauri desktop app: `src/session.rs` (everything the
+  UI asks for, plain Rust and unit-tested), `src/main.rs` (Tauri commands and
+  events), `ui/` (HTML/CSS/JS, no build step), `dev/` (preview harness, icon
+  generator)
 - `dev/cells2png.py` — renders a TUI screen dump to PNG to check colours

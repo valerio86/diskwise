@@ -119,7 +119,8 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         if let Modal::ConfirmTrash { targets, .. } = &modal {
             match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => {
-                    app.status = Some(app.apply_trash(targets, move_to_trash));
+                    app.status =
+                        Some(app.apply_trash(targets, diskwise_core::actions::move_to_trash));
                 }
                 KeyCode::Char('n') | KeyCode::Esc | KeyCode::Char('q') => {
                     app.status = Some("Cancelled.".into())
@@ -149,17 +150,4 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('?') => app.modal = Some(Modal::Help),
         _ => {}
     }
-}
-
-/// Move one path to the system Trash. On macOS this uses NSFileManager rather than
-/// asking Finder: no extra permission prompt, and it works over SSH.
-fn move_to_trash(path: &Path) -> Result<(), String> {
-    #[allow(unused_mut)] // only mutated on macOS
-    let mut ctx = trash::TrashContext::default();
-    #[cfg(target_os = "macos")]
-    {
-        use trash::macos::{DeleteMethod, TrashContextExtMacos};
-        ctx.set_delete_method(DeleteMethod::NsFileManager);
-    }
-    ctx.delete(path).map_err(|e| e.to_string())
 }

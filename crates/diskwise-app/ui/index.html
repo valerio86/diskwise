@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>diskwise</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <header class="top">
+      <div class="brand" aria-label="diskwise">
+        <svg class="brand-mark" viewBox="0 0 24 24" aria-hidden="true">
+          <rect x="2" y="2" width="11" height="20" rx="2.5" class="m-slate" />
+          <rect x="14.5" y="2" width="7.5" height="10" rx="2.5" class="m-safe" />
+          <rect x="14.5" y="13.5" width="7.5" height="5" rx="2" class="m-caution" />
+          <rect x="14.5" y="20" width="3.5" height="2" rx="1" class="m-review" />
+        </svg>
+        <span>diskwise</span>
+      </div>
+      <div class="disk" id="disk" hidden>
+        <div class="meter" role="img" id="disk-meter"><div class="meter-fill" id="disk-fill"></div></div>
+        <div class="disk-text"><strong id="disk-pct"></strong> <span id="disk-free"></span></div>
+      </div>
+      <button class="quiet" id="rescan" type="button" hidden>Scan again</button>
+    </header>
+
+    <main class="layout" id="layout" hidden>
+      <section class="map-pane" aria-label="Disk map">
+        <div class="map-bar">
+          <nav class="crumbs" id="crumbs" aria-label="Folder path"></nav>
+          <div class="chip" id="chip" hidden></div>
+          <div class="seg" role="tablist" aria-label="View">
+            <button role="tab" id="as-map" aria-selected="true" type="button">Map</button>
+            <button role="tab" id="as-list" aria-selected="false" type="button">List</button>
+          </div>
+        </div>
+        <div class="map" id="map" aria-label="Folder contents"></div>
+        <div class="list" id="list" hidden></div>
+        <div class="map-foot">
+          <ul class="legend" aria-label="Legend">
+            <li><span class="swatch s-safe"></span>Safe to clean</li>
+            <li><span class="swatch s-caution"></span>Safe after a step</li>
+            <li><span class="swatch s-review"></span>Your call</li>
+            <li><span class="swatch s-none"></span>No suggestion</li>
+          </ul>
+          <p class="hint">Click to select, double-click a folder to open it, Backspace to go up.</p>
+        </div>
+      </section>
+
+      <aside class="side" aria-label="Details">
+        <div class="seg side-tabs" role="tablist">
+          <button role="tab" id="tab-suggestions" aria-selected="true" type="button">Suggestions</button>
+          <button role="tab" id="tab-selected" aria-selected="false" type="button">Selected</button>
+        </div>
+        <div id="pane-suggestions" class="pane"></div>
+        <div id="pane-selected" class="pane" hidden></div>
+      </aside>
+    </main>
+
+    <div class="scanning" id="scanning">
+      <svg class="brand-mark big" viewBox="0 0 24 24" aria-hidden="true">
+        <rect x="2" y="2" width="11" height="20" rx="2.5" class="m-slate" />
+        <rect x="14.5" y="2" width="7.5" height="10" rx="2.5" class="m-safe pulse" />
+        <rect x="14.5" y="13.5" width="7.5" height="5" rx="2" class="m-caution pulse d1" />
+        <rect x="14.5" y="20" width="3.5" height="2" rx="1" class="m-review pulse d2" />
+      </svg>
+      <h1 id="scan-title">Getting ready…</h1>
+      <p class="scan-counts" id="scan-counts" aria-live="polite"></p>
+      <p class="scan-note" id="scan-note"></p>
+    </div>
+
+    <div class="tooltip" id="tooltip" role="tooltip" hidden></div>
+    <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+
+    <dialog id="dialog">
+      <form method="dialog">
+        <h2 id="dialog-title"></h2>
+        <div id="dialog-body"></div>
+        <div class="dialog-actions" id="dialog-actions"></div>
+      </form>
+    </dialog>
+
+    <script src="app.js"></script>
+  </body>
+</html>

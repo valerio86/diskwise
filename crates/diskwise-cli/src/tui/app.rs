@@ -456,22 +456,7 @@ impl App {
 
     /// Paths diskwise refuses to trash however they're selected.
     fn protected_reason(&self, path: &str) -> Option<String> {
-        let depth = path.split('/').filter(|s| !s.is_empty()).count();
-        let parent = Path::new(path)
-            .parent()
-            .and_then(|p| p.to_str())
-            .unwrap_or("");
-        if depth <= 1 {
-            Some(format!(
-                "{path} is a top-level system folder. diskwise won't move it to the Trash."
-            ))
-        } else if parent == self.platform.home_base {
-            Some(format!(
-                "{path} is a home folder. diskwise won't move it to the Trash."
-            ))
-        } else {
-            None
-        }
+        diskwise_core::actions::protected_reason(path, self.platform)
     }
 
     /// Move the confirmed targets to the Trash with `trasher`, then verify each is
@@ -526,15 +511,7 @@ impl App {
     /// firmlinked at `/` (e.g. /Users, not /.adobeTemp), so always act on the
     /// path under the real scan root.
     fn real_path(&self, display: &str) -> String {
-        let rel = display
-            .strip_prefix(self.root_display.as_str())
-            .unwrap_or(display)
-            .trim_start_matches('/');
-        if rel.is_empty() {
-            self.snap.root.clone()
-        } else {
-            join(&self.snap.root, rel)
-        }
+        self.snap.real_path(display)
     }
 
     fn remove_from_tree(&mut self, path: &str) {

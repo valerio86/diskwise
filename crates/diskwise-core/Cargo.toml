@@ -12,6 +12,7 @@ libc.workspace = true
 rayon.workspace = true
 serde.workspace = true
 toml.workspace = true
+trash.workspace = true
 xattr.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
