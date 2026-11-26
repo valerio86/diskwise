@@ -26,7 +26,8 @@
 #                    admin    – needs your admin password (owned by root)
 #                    archive  – move to external or cloud storage
 #                    info     – nothing to delete; explains where space went
-#   why / how / prevent   shown to the user
+#   why / how / prevent   shown to the user. Put commands in `backticks`: the desktop
+#                         app shows them as code with a Copy button, the TUI highlights them.
 
 # ── Developer tooling ───────────────────────────────────────────────────────
 

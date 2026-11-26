@@ -81,6 +81,50 @@ function ago(unix) {
   return `${Math.floor(days / 365)} years ago`;
 }
 
+/** Text with `commands` in backticks, as nodes: commands become code with a
+ *  Copy button (rule texts put every command in backticks; a test enforces it). */
+function rich(text) {
+  return text.split("`").map((part, i) => (i % 2 === 0 ? part : command(part)));
+}
+
+function command(cmd) {
+  const button = h(
+    "button",
+    {
+      type: "button",
+      class: "copy",
+      "aria-label": `Copy command: ${cmd}`,
+      onclick: async (e) => {
+        e.stopPropagation();
+        const ok = await copyText(cmd);
+        button.textContent = ok ? "Copied" : "Copy failed";
+        button.classList.toggle("done", ok);
+        setTimeout(() => {
+          button.textContent = "Copy";
+          button.classList.remove("done");
+        }, 1600);
+      },
+    },
+    "Copy",
+  );
+  return h("span", { class: "cmd" }, h("code", {}, cmd), button);
+}
+
+async function copyText(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch {
+    // Older webviews: fall back to a hidden textarea and execCommand.
+    const area = h("textarea", { style: { position: "fixed", opacity: "0" } }, text);
+    document.body.append(area);
+    area.select();
+    const ok = document.execCommand("copy");
+    area.remove();
+    return ok;
+  }
+}
+
 function badge(safety) {
   return h("span", { class: `badge b-${safety}`, "aria-hidden": "true" });
 }
@@ -265,8 +309,8 @@ function renderSuggestionDetail() {
       h("p", { class: "sd-size" }, f.size_known ? bytes(f.bytes) : "Size not reported by the system"),
     ),
     h("p", { class: "sd-why" }, f.why),
-    h("section", { class: "sd-block" }, h("h2", {}, "What to do"), h("p", {}, f.how)),
-    f.prevent ? h("section", { class: "sd-block" }, h("h2", {}, "To stop it coming back"), h("p", { class: "sd-code" }, f.prevent)) : null,
+    h("section", { class: "sd-block" }, h("h2", {}, "What to do"), h("p", {}, rich(f.how))),
+    f.prevent ? h("section", { class: "sd-block" }, h("h2", {}, "To stop it coming back"), h("p", {}, rich(f.prevent))) : null,
     items.length
       ? h("section", { class: "sd-block" }, h("h2", {}, f.items.length === 1 ? "Where" : `Where (${f.items.length} items)`), h("ul", { class: "sd-items" }, items))
       : null,
@@ -632,7 +676,7 @@ function renderSelected() {
           "div",
           { class: "callout" },
           h("h3", {}, badge(f.safety), t.direct ? f.title : `Inside "${f.title}"`),
-          h("p", { class: "f-how" }, f.how),
+          h("p", { class: "f-how" }, rich(f.how)),
           h("button", { type: "button", class: "link", onclick: () => backToSuggestion(f.index) }, "Read the whole suggestion"),
         )
       : t.cleanable
@@ -656,7 +700,7 @@ function showPlan(plan) {
   const actions = $("dialog-actions");
   if (plan.type === "refuse") {
     $("dialog-title").textContent = plan.title;
-    fill(body, h("p", {}, plan.body));
+    fill(body, h("p", {}, rich(plan.body)));
     fill(actions, h("button", { class: "btn primary", value: "ok" }, "OK"));
     dialog.onclose = null;
     dialog.showModal();
@@ -667,7 +711,7 @@ function showPlan(plan) {
     body,
     h("ul", { class: "targets" }, plan.targets.map((t) => h("li", {}, h("span", { class: "i-size" }, bytes(t.bytes)), h("span", { class: "i-path" }, t.path)))),
     h("p", {}, `${bytes(plan.total)} in total. You can take items back out of the Trash until it's emptied.`),
-    plan.warning ? h("p", { class: "warning" }, plan.warning) : null,
+    plan.warning ? h("p", { class: "warning" }, rich(plan.warning)) : null,
   );
   fill(actions, h("button", { class: "btn", value: "cancel" }, "Cancel"), h("button", { class: "btn danger", value: "trash" }, "Move to Trash"));
   dialog.returnValue = "";

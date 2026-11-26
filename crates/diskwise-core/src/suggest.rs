@@ -54,7 +54,7 @@ fn skipped_mounts_finding(snap: &Snapshot) -> Option<Finding> {
             p.display_path(&snap.root),
             paths.join(", ")
         ),
-        "Scan each one directly (e.g. `diskwise suggest /home`), or rescan with --cross-mounts.",
+        "Scan each one directly (e.g. `diskwise suggest /home`), or rescan with `diskwise suggest --cross-mounts`.",
     );
     f.items = paths
         .into_iter()
@@ -296,7 +296,7 @@ fn system_findings(snap: &Snapshot) -> Vec<Finding> {
             how.push("OS-update snapshots go away once the pending macOS update is installed and you restart.");
         }
         if time_machine > 0 {
-            how.push("Time Machine snapshots are removed automatically when space runs low; to remove them now: sudo tmutil deletelocalsnapshots /");
+            how.push("Time Machine snapshots are removed automatically when space runs low; to remove them now, run `sudo tmutil deletelocalsnapshots /`.");
         }
         if how.is_empty() {
             how.push("List them with `tmutil listlocalsnapshots /`.");

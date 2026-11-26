@@ -352,16 +352,40 @@ button { font: inherit; color: inherit; }
 .sd-block { margin: 0 0 18px; }
 .sd-block h2 { font-size: 13px; font-weight: 600; margin: 0 0 4px; }
 .sd-block p { margin: 0; }
-.sd-code {
+/* Commands: monospace, selectable, with a Copy button that says what happened. */
+.cmd {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 2px;
+  max-width: 100%;
+  background: color-mix(in oklab, var(--text) 9%, transparent);
+  border-radius: 6px;
+  padding: 1px 2px 1px 7px;
+  margin: 1px 0;
+  vertical-align: baseline;
+}
+.cmd code {
   font-family: ui-monospace, "SF Mono", Menlo, monospace;
-  font-size: 12px;
-  background: var(--panel-2);
-  border-radius: 7px;
-  padding: 8px 10px;
+  font-size: 0.92em;
   -webkit-user-select: text;
   user-select: text;
-  word-break: break-word;
+  overflow-wrap: anywhere;
 }
+.copy {
+  border: 0;
+  background: transparent;
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: 600;
+  border-radius: 4px;
+  padding: 1px 6px;
+  cursor: pointer;
+  white-space: nowrap;
+  align-self: center;
+}
+.copy:hover { background: var(--line); }
+.copy.done { color: var(--safe); }
+
 .sd-items { list-style: none; margin: 0; padding: 0; }
 .sd-items li { display: grid; grid-template-columns: 76px 1fr auto; gap: 12px; padding: 4px 0; border-bottom: 1px solid var(--line); }
 .sd-items .i-size { text-align: right; font-weight: 600; }

@@ -328,6 +328,23 @@ fn age(newest_mtime: i64, now: i64) -> String {
     }
 }
 
+/// Text with `commands` in backticks: commands drawn in the accent colour (bold,
+/// which also shows without colour), backticks dropped. A terminal can't offer a
+/// Copy button, but the command stands out and can be selected.
+fn rich(text: &str, base: Style) -> Vec<Span<'static>> {
+    text.split('`')
+        .enumerate()
+        .filter(|(_, part)| !part.is_empty())
+        .map(|(i, part)| {
+            if i % 2 == 1 {
+                Span::styled(part.to_string(), accent().bold())
+            } else {
+                Span::styled(part.to_string(), base)
+            }
+        })
+        .collect()
+}
+
 fn finding_lines(f: &Finding) -> Vec<Line<'static>> {
     let mut lines = vec![
         Line::from(vec![
@@ -336,16 +353,18 @@ fn finding_lines(f: &Finding) -> Vec<Line<'static>> {
             Span::styled(format!("   {} · {}", f.category, f.action), muted()),
         ]),
         Line::from(f.why.clone()),
-        Line::from(vec![
-            Span::styled("→ ", accent().bold()),
-            Span::raw(f.how.clone()),
-        ]),
+        Line::from(
+            [
+                vec![Span::styled("→ ", accent().bold())],
+                rich(&f.how, Style::new()),
+            ]
+            .concat(),
+        ),
     ];
     if let Some(p) = &f.prevent {
-        lines.push(Line::from(vec![
-            Span::styled("Prevent: ", muted()),
-            Span::styled(p.clone(), muted()),
-        ]));
+        lines.push(Line::from(
+            [vec![Span::styled("Prevent: ", muted())], rich(p, muted())].concat(),
+        ));
     }
     lines
 }
@@ -389,14 +408,17 @@ fn draw_entry_details(f: &mut Frame, app: &App, area: Rect) {
             lines.push(Line::from(Span::styled(facts, muted())));
             match app.coverage(&path) {
                 Some(c) if c.direct => lines.extend(finding_lines(c.finding)),
-                Some(c) => lines.push(Line::from(vec![
-                    Span::raw("Inside "),
-                    Span::styled(c.finding.title.clone(), safety_style(c.finding.safety)),
-                    Span::styled(
-                        format!(" ({}): {}", c.finding.safety, c.finding.how),
-                        muted(),
-                    ),
-                ])),
+                Some(c) => lines.push(Line::from(
+                    [
+                        vec![
+                            Span::raw("Inside "),
+                            Span::styled(c.finding.title.clone(), safety_style(c.finding.safety)),
+                            Span::styled(format!(" ({}): ", c.finding.safety), muted()),
+                        ],
+                        rich(&c.finding.how, muted()),
+                    ]
+                    .concat(),
+                )),
                 None => lines.push(Line::from(Span::styled(
                     "No suggestion covers this item.",
                     muted(),
@@ -594,7 +616,7 @@ fn draw_modal(f: &mut Frame, modal: &Modal) {
             title.clone(),
             Text::from(
                 body.lines()
-                    .map(|l| Line::from(l.to_string()))
+                    .map(|l| Line::from(rich(l, Style::new())))
                     .collect::<Vec<_>>(),
             ),
             th().accent,
@@ -794,6 +816,20 @@ mod tests {
         assert!(
             screen.contains("move to Trash") && screen.contains("cancel"),
             "{screen}"
+        );
+    }
+
+    #[test]
+    fn commands_drop_backticks_and_stand_out() {
+        let spans = rich("Run `sudo apt clean` now.", Style::new());
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "Run sudo apt clean now.");
+        assert_eq!(spans[1].content, "sudo apt clean");
+        assert!(
+            spans[1]
+                .style
+                .add_modifier
+                .contains(ratatui::style::Modifier::BOLD)
         );
     }
 

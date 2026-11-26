@@ -21,7 +21,7 @@ safety = "caution"
 action = "in_app"
 why = "Gemini Nano, downloaded by Chrome for built-in AI features. Deleting it alone doesn't help: Chrome downloads it again."
 how = "Turn the model off with the policy below, then restart Chrome. Chrome removes the folder itself."
-prevent = "defaults write com.google.Chrome GenAILocalFoundationalModelSettings -integer 1   (undo: defaults delete com.google.Chrome GenAILocalFoundationalModelSettings)"
+prevent = "Run `defaults write com.google.Chrome GenAILocalFoundationalModelSettings -integer 1`. To undo it: `defaults delete com.google.Chrome GenAILocalFoundationalModelSettings`."
 
 [[rule]]
 id = "google-updater-cache"
@@ -73,7 +73,7 @@ category = "installer"
 safety = "caution"
 action = "admin"
 why = "A hidden folder where Creative Cloud stages app installers (.pimx). Old ones are often never cleaned up."
-how = "Make sure Creative Cloud isn't installing or updating anything, then run: sudo rm -rf /System/Volumes/Data/.adobeTemp/*"
+how = "Make sure Creative Cloud isn't installing or updating anything, then run `sudo rm -rf /System/Volumes/Data/.adobeTemp/*`."
 
 [[rule]]
 id = "adobe-media-cache"
@@ -249,7 +249,7 @@ category = "cache"
 safety = "caution"
 action = "admin"
 why = "Caches shared by all users. Most are rebuilt automatically."
-how = "Use Finder with an admin password, or `sudo rm -rf` on specific subfolders. Leave Apple folders alone if unsure."
+how = "Use Finder with an admin password, or remove specific subfolders in Terminal with sudo. Leave Apple folders alone if unsure."
 
 [[rule]]
 id = "system-logs"

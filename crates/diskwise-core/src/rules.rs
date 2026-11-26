@@ -514,6 +514,63 @@ mod tests {
         );
     }
 
+    /// Commands must be in backticks so the apps can show them as code (with a
+    /// Copy button in the desktop app). Catches e.g. "then run: sudo rm -rf …".
+    #[test]
+    fn commands_are_in_backticks() {
+        const COMMANDS: [&str; 22] = [
+            "sudo",
+            "defaults",
+            "docker",
+            "journalctl",
+            "flatpak",
+            "apt",
+            "dnf",
+            "pacman",
+            "paccache",
+            "xcrun",
+            "tmutil",
+            "snap",
+            "systemctl",
+            "cargo",
+            "npm",
+            "uv",
+            "ollama",
+            "pip",
+            "python",
+            "brew",
+            "coredumpctl",
+            "rm",
+        ];
+        let mut bad = Vec::new();
+        for p in [&MACOS, &LINUX] {
+            for r in RuleSet::builtin_for(p).unwrap().rules() {
+                for (field, text) in [
+                    ("how", Some(&r.def.how)),
+                    ("prevent", r.def.prevent.as_ref()),
+                ] {
+                    let Some(text) = text else { continue };
+                    // Drop the backticked parts, then look for "<command> <argument>".
+                    let outside: String = text.split('`').step_by(2).collect::<Vec<_>>().join(" ");
+                    let words: Vec<&str> = outside.split_whitespace().collect();
+                    for pair in words.windows(2) {
+                        let next = pair[1].chars().next().unwrap_or(' ');
+                        if COMMANDS.contains(&pair[0]) && (next.is_ascii_lowercase() || next == '-')
+                        {
+                            bad.push(format!("{} {field}: {:?}", r.def.id, text));
+                        }
+                    }
+                }
+            }
+        }
+        bad.dedup();
+        assert!(
+            bad.is_empty(),
+            "commands outside backticks:\n{}",
+            bad.join("\n")
+        );
+    }
+
     #[test]
     fn fallback_rules_sort_after_specific_ones() {
         for p in [&MACOS, &LINUX] {

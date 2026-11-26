@@ -10,7 +10,7 @@ category = "cache"
 safety = "safe"
 action = "admin"
 why = "Copies of every .deb package apt has downloaded. Installed software doesn't need them."
-how = "sudo apt clean"
+how = "Run `sudo apt clean`."
 
 [[rule]]
 id = "dnf-cache"
@@ -20,7 +20,7 @@ category = "cache"
 safety = "safe"
 action = "admin"
 why = "Package downloads and repository metadata cached by dnf or yum."
-how = "sudo dnf clean all"
+how = "Run `sudo dnf clean all`."
 
 [[rule]]
 id = "pacman-cache"
@@ -30,7 +30,7 @@ category = "cache"
 safety = "safe"
 action = "admin"
 why = "Every package version pacman has downloaded. Old ones are only useful for downgrading."
-how = "sudo paccache -rk2 (from pacman-contrib; keeps the two newest versions), or sudo pacman -Sc"
+how = "Run `sudo paccache -rk2` (from pacman-contrib; keeps the two newest versions), or `sudo pacman -Sc`."
 
 [[rule]]
 id = "snap-revisions"
@@ -42,7 +42,7 @@ safety = "review"
 action = "in_app"
 why = "Snap keeps older revisions of each installed snap so it can roll back an update."
 how = "List them with `snap list --all` (old ones show as \"disabled\") and remove one with `sudo snap remove <name> --revision=<rev>`."
-prevent = "sudo snap set system refresh.retain=2"
+prevent = "Run `sudo snap set system refresh.retain=2`."
 
 [[rule]]
 id = "flatpak"
@@ -53,7 +53,7 @@ category = "app_managed"
 safety = "review"
 action = "in_app"
 why = "Flatpak apps plus the shared runtimes they depend on. Runtimes stay installed after the last app that used them is removed."
-how = "flatpak uninstall --unused"
+how = "Run `flatpak uninstall --unused`."
 
 [[rule]]
 id = "kernel-modules"
@@ -64,7 +64,7 @@ category = "system"
 safety = "review"
 action = "admin"
 why = "Modules for every installed kernel version. Old kernels pile up when the package manager keeps them for fallback."
-how = "Debian/Ubuntu: sudo apt autoremove --purge. Fedora: set installonly_limit in /etc/dnf/dnf.conf. Keep the running kernel (uname -r) and one known-good one."
+how = "Debian/Ubuntu: run `sudo apt autoremove --purge`. Fedora: set installonly_limit in /etc/dnf/dnf.conf. Keep the running kernel (`uname -r` shows it) and one known-good one."
 
 [[rule]]
 id = "swap-file"
@@ -75,7 +75,7 @@ category = "system"
 safety = "review"
 action = "info"
 why = "Disk space reserved as overflow memory. It is allocated in full whether or not it's being used."
-how = "Usually best left alone. To shrink it: sudo swapoff the file, recreate it smaller (fallocate + mkswap), then swapon. Check `free -h` first."
+how = "Usually best left alone. To shrink it, turn it off (`sudo swapoff /swapfile`), recreate it smaller with fallocate and mkswap, then turn it back on (`sudo swapon /swapfile`). Check `free -h` first."
 
 # ── Services and logs ───────────────────────────────────────────────────────
 
@@ -88,8 +88,8 @@ category = "logs"
 safety = "caution"
 action = "admin"
 why = "System logs kept by journald. By default they may grow to 10% of the filesystem (capped at 4 GB)."
-how = "sudo journalctl --vacuum-size=200M (or --vacuum-time=30d)"
-prevent = "Set SystemMaxUse=200M in /etc/systemd/journald.conf, then sudo systemctl restart systemd-journald"
+how = "Run `sudo journalctl --vacuum-size=200M` (or `sudo journalctl --vacuum-time=30d`)."
+prevent = "Set SystemMaxUse=200M in /etc/systemd/journald.conf, then run `sudo systemctl restart systemd-journald`."
 
 [[rule]]
 id = "docker-data"
@@ -99,7 +99,7 @@ category = "developer"
 safety = "caution"
 action = "in_app"
 why = "Everything Docker stores. Unused images and stopped containers often take most of it."
-how = "docker system prune -a (add --volumes to also drop unused volumes; check first, volumes may hold data). Don't delete files here by hand."
+how = "Run `docker system prune -a` (add --volumes to also drop unused volumes; check first, volumes may hold data). Don't delete files here by hand."
 
 [[rule]]
 id = "core-dumps"
