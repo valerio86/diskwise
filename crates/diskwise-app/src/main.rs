@@ -13,9 +13,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use diskwise_core::dupes::{Action as DupeAction, DupeProgress};
 use diskwise_core::scan::ScanProgress;
 use diskwise_core::{DEFAULT_ROOT, RuleSet, ScanOptions, Snapshot};
 use serde::Serialize;
+use session::dupes::{DupePlan, DupesView, KeeperResult};
 use session::{Plan, Session, Summary, TrashResult, View};
 use tauri::{AppHandle, Emitter, State};
 
@@ -98,6 +100,7 @@ async fn start_scan(
                 scan_with_progress(&app, root).and_then(|s| open_session(s, true))
             }
         };
+        let ready = result.is_ok();
         let done = match result {
             Ok(session) => {
                 *lock(&state.session) = Some(session);
@@ -107,8 +110,53 @@ async fn start_scan(
         };
         state.scanning.store(false, Ordering::SeqCst);
         let _ = app.emit("scan-done", done);
+        if ready {
+            check_dupes(&app, &state);
+        }
     });
     Ok(())
+}
+
+#[derive(Clone, Serialize)]
+struct DupeProgressEvent {
+    done: u64,
+    total: u64,
+}
+
+/// Look for duplicates in the background on a copy of the scan. Progress
+/// arrives as `dupes-progress` events and the end as `dupes-done`; a check
+/// started later (or a rescan) makes this one's result be ignored.
+fn check_dupes(app: &AppHandle, state: &Arc<AppState>) {
+    let Some(job) = lock(&state.session).as_mut().and_then(|s| s.begin_dupes()) else {
+        let _ = app.emit("dupes-done", ());
+        return;
+    };
+    let (app, state) = (app.clone(), Arc::clone(state));
+    std::thread::spawn(move || {
+        let progress = Arc::new(DupeProgress::default());
+        let p = progress.clone();
+        let worker = std::thread::spawn(move || {
+            let report =
+                diskwise_core::dupes::find(&job.snap, job.cache.as_deref(), Some(p), &job.prefs);
+            (job.generation, report)
+        });
+        while !worker.is_finished() {
+            let _ = app.emit(
+                "dupes-progress",
+                DupeProgressEvent {
+                    done: progress.done_bytes.load(Ordering::Relaxed),
+                    total: progress.total_bytes.load(Ordering::Relaxed),
+                },
+            );
+            std::thread::sleep(Duration::from_millis(150));
+        }
+        if let Ok((generation, report)) = worker.join()
+            && let Some(s) = lock(&state.session).as_mut()
+        {
+            s.finish_dupes(generation, report);
+        }
+        let _ = app.emit("dupes-done", ());
+    });
 }
 
 fn scan_with_progress(app: &AppHandle, root: &std::path::Path) -> Result<Snapshot, String> {
@@ -181,11 +229,105 @@ async fn plan_finding(state: State<'_, Arc<AppState>>, id: String) -> Result<Pla
 /// Moving to the Trash can take a while (copies across filesystems on Linux), so
 /// it runs on a blocking-friendly worker thread.
 #[tauri::command]
-async fn trash(state: State<'_, Arc<AppState>>, paths: Vec<String>) -> Result<TrashResult, String> {
-    let state = Arc::clone(&state);
-    tauri::async_runtime::spawn_blocking(move || with_session(&state, |s| s.trash_for_real(&paths)))
-        .await
-        .map_err(|e| format!("Moving to the Trash stopped unexpectedly: {e}"))?
+async fn trash(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+    paths: Vec<String>,
+) -> Result<TrashResult, String> {
+    let st = Arc::clone(&state);
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        with_session(&st, |s| s.trash_for_real(&paths))
+    })
+    .await
+    .map_err(|e| format!("Moving to the Trash stopped unexpectedly: {e}"))??;
+    // What's left may have changed: check duplicates again.
+    check_dupes(&app, &state);
+    Ok(result)
+}
+
+#[tauri::command]
+async fn dupes(state: State<'_, Arc<AppState>>) -> Result<DupesView, String> {
+    with_session(&state, |s| s.dupes_view())
+}
+
+#[tauri::command]
+async fn dupe_set_action(
+    state: State<'_, Arc<AppState>>,
+    id: String,
+    path: String,
+    action: DupeAction,
+) -> Result<DupesView, String> {
+    with_session(&state, |s| {
+        s.dupe_set_action(&id, &path, action)?;
+        Ok(s.dupes_view())
+    })?
+}
+
+#[tauri::command]
+async fn dupe_set_keeper(
+    state: State<'_, Arc<AppState>>,
+    id: String,
+    path: String,
+) -> Result<KeeperResult, String> {
+    with_session(&state, |s| s.dupe_set_keeper(&id, &path))?
+}
+
+/// "Always prefer copies in `prefer` over `over`": saved, then checked again.
+#[tauri::command]
+async fn dupe_prefer_folder(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+    prefer: String,
+    over: String,
+) -> Result<(), String> {
+    with_session(&state, |s| s.dupe_prefer_folder(&prefer, &over))??;
+    check_dupes(&app, &state);
+    Ok(())
+}
+
+#[tauri::command]
+async fn dupe_folder_options(
+    state: State<'_, Arc<AppState>>,
+    id: String,
+    path: String,
+) -> Result<Vec<String>, String> {
+    with_session(&state, |s| s.dupe_folder_options(&id, &path))
+}
+
+#[tauri::command]
+async fn dupe_mark_intentional(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+    folder: String,
+) -> Result<(), String> {
+    with_session(&state, |s| s.dupe_mark_intentional(&folder))??;
+    check_dupes(&app, &state);
+    Ok(())
+}
+
+#[tauri::command]
+async fn dupe_plan(state: State<'_, Arc<AppState>>, id: String) -> Result<DupePlan, String> {
+    with_session(&state, |s| s.dupe_plan(&id))
+}
+
+/// Carry out a group's choices; may take a while (hashing, cloning), so it
+/// runs on a blocking-friendly worker thread. Then duplicates are checked again.
+#[tauri::command]
+async fn dupe_apply(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+    id: String,
+) -> Result<TrashResult, String> {
+    let st = Arc::clone(&state);
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        with_session(&st, |s| {
+            s.dupe_apply(&id, &diskwise_core::actions::move_to_trash)
+        })
+    })
+    .await
+    .map_err(|e| format!("Stopped unexpectedly: {e}"))??;
+    check_dupes(&app, &state);
+    Ok(result)
 }
 
 /// Show an item in Finder (macOS) or its folder in the file manager (Linux).
@@ -234,7 +376,15 @@ fn main() {
             plan_path,
             plan_finding,
             trash,
-            reveal
+            reveal,
+            dupes,
+            dupe_set_action,
+            dupe_set_keeper,
+            dupe_prefer_folder,
+            dupe_folder_options,
+            dupe_mark_intentional,
+            dupe_plan,
+            dupe_apply
         ])
         .run(tauri::generate_context!())
         .expect("error while running diskwise");

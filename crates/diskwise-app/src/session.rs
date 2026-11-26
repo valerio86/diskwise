@@ -8,6 +8,9 @@ use diskwise_core::rules::{Action, Category, Safety};
 use diskwise_core::{Finding, NodeKind, RuleSet, Snapshot, analyze, human_bytes};
 use serde::Serialize;
 
+pub mod dupes;
+use dupes::{DupeStatus, GroupState};
+
 /// One scan plus its analysis, with lookups rebuilt whenever either changes.
 pub struct Session {
     pub snap: Snapshot,
@@ -22,6 +25,15 @@ pub struct Session {
     claimed: HashMap<String, usize>,
     /// Display path → safe/caution bytes somewhere beneath it.
     cleanable_below: HashMap<String, u64>,
+    // ── Duplicates ──
+    dupe_status: DupeStatus,
+    dupe_groups: Vec<GroupState>,
+    /// Bumped by every check, so a result that arrives after a newer check
+    /// started (or after a rescan) is ignored.
+    dupe_generation: u64,
+    prefs: diskwise_core::dupes::Prefs,
+    prefs_path: Option<std::path::PathBuf>,
+    dupe_cache: Option<std::path::PathBuf>,
 }
 
 #[derive(Serialize)]
@@ -170,6 +182,14 @@ impl Session {
             findings: Vec::new(),
             claimed: HashMap::new(),
             cleanable_below: HashMap::new(),
+            dupe_status: DupeStatus::NotStarted,
+            dupe_groups: Vec::new(),
+            dupe_generation: 0,
+            prefs: dupes::prefs_location()
+                .map(|p| diskwise_core::dupes::Prefs::load(&p))
+                .unwrap_or_default(),
+            prefs_path: dupes::prefs_location(),
+            dupe_cache: dupes::cache_location(),
         };
         s.reanalyze();
         s
@@ -477,6 +497,7 @@ impl Session {
             match trasher(std::path::Path::new(&real)) {
                 Ok(()) => {
                     self.snap.remove(p);
+                    diskwise_core::dupes::forget(&mut self.snap, p);
                     moved += 1;
                     bytes += size;
                 }
@@ -879,6 +900,13 @@ mod tests {
         let file = std::env::var("DISKWISE_SNAPSHOT").expect("set DISKWISE_SNAPSHOT");
         let snap: Snapshot = serde_json::from_slice(&std::fs::read(file).unwrap()).unwrap();
         let rules = RuleSet::builtin_for(snap.platform()).unwrap();
+        // Duplicates are only checked on a live session; do that on a copy.
+        let live_rules = RuleSet::builtin_for(snap.platform()).unwrap();
+        let mut live = Session::new(snap.clone(), live_rules, 1_795_000_000, true);
+        let job = live.begin_dupes().unwrap();
+        let report = diskwise_core::dupes::find(&job.snap, None, None, &job.prefs);
+        live.finish_dupes(job.generation, report);
+        let dupes = live.dupes_view();
         let s = Session::new(snap, rules, 1_795_000_000, false);
         let summary = s.summary();
         // Every folder down to a few levels, plus each suggestion's folder.
@@ -909,9 +937,10 @@ mod tests {
             .filter_map(|p| s.view(Some(&p)).map(|v| (p, v)))
             .collect();
         let js = format!(
-            "window.FIXTURE = {{ summary: {}, views: {} }};\n",
+            "window.FIXTURE = {{ summary: {}, views: {}, dupes: {} }};\n",
             serde_json::to_string(&summary).unwrap(),
-            serde_json::to_string(&views).unwrap()
+            serde_json::to_string(&views).unwrap(),
+            serde_json::to_string(&dupes).unwrap()
         );
         std::fs::write(concat!(env!("CARGO_MANIFEST_DIR"), "/dev/fixture.js"), js).unwrap();
     }

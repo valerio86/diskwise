@@ -45,6 +45,87 @@ pub struct Done {
     pub already_shared: u64,
 }
 
+/// One step of a group's plan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Step {
+    pub target: Target,
+    pub how: How,
+    /// What it frees.
+    pub bytes: u64,
+    /// The copy is in a synced folder (trashing it removes it everywhere).
+    pub synced: bool,
+}
+
+/// What carrying out a group's chosen actions would do.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupPlan {
+    pub steps: Vec<Step>,
+    /// Extra copies still marked "your call": left as they are.
+    pub undecided: usize,
+}
+
+impl GroupPlan {
+    pub fn total(&self) -> u64 {
+        self.steps.iter().map(|s| s.bytes).sum()
+    }
+
+    /// A warning to show with the confirmation, if any.
+    pub fn warning(&self) -> Option<String> {
+        let mut parts = Vec::new();
+        if self.steps.iter().any(|s| s.synced && s.how == How::Trash) {
+            parts.push(
+                "A copy in a synced folder will be removed on every synced device too.".to_string(),
+            );
+        }
+        if self.undecided > 0 {
+            parts.push(format!(
+                "{} undecided {} left as {}.",
+                self.undecided,
+                if self.undecided == 1 {
+                    "copy is"
+                } else {
+                    "copies are"
+                },
+                if self.undecided == 1 {
+                    "it is"
+                } else {
+                    "they are"
+                }
+            ));
+        }
+        (!parts.is_empty()).then(|| parts.join(" "))
+    }
+}
+
+/// The steps for a group (keeper first in `copies`): each extra copy set to
+/// Trash or Store once.
+pub fn plan(copies: &[super::Copy], folder: bool) -> GroupPlan {
+    let keeper = &copies[0].path;
+    let mut out = GroupPlan::default();
+    for c in &copies[1..] {
+        let how = match c.action {
+            Some(super::Action::Trash) => How::Trash,
+            Some(super::Action::StoreOnce) => How::StoreOnce,
+            Some(super::Action::Review) => {
+                out.undecided += 1;
+                continue;
+            }
+            _ => continue,
+        };
+        out.steps.push(Step {
+            target: Target {
+                keeper: keeper.clone(),
+                copy: c.path.clone(),
+                folder,
+            },
+            how,
+            bytes: c.frees,
+            synced: c.synced,
+        });
+    }
+    out
+}
+
 /// Every reason not to act on `t` right now.
 pub fn check(snap: &Snapshot, protection: &Protection, t: &Target) -> Result<(), String> {
     if snap.platform() != crate::platform::CURRENT {
@@ -152,8 +233,7 @@ pub fn record(snap: &mut Snapshot, t: &Target, how: How) {
     match how {
         How::Trash => {
             snap.remove(&t.copy);
-            snap.large_files
-                .retain(|f| f.path != t.copy && !inside(&f.path, &t.copy));
+            super::forget(snap, &t.copy);
         }
         How::StoreOnce => {
             let root = snap.display_root();

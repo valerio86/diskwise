@@ -590,14 +590,16 @@ fn draw_suggestion_details(f: &mut Frame, app: &App, area: Rect) {
 
 /// What a duplicate copy's action is called, and its colour.
 fn dupe_label(i: usize, action: Option<DupeAction>) -> (&'static str, Style) {
-    match (i, action) {
-        (0, _) => ("keep", accent().bold()),
-        (_, Some(DupeAction::Trash)) => ("trash", Style::new().fg(th().caution)),
-        (_, Some(DupeAction::StoreOnce)) => ("store once", Style::new().fg(th().safe)),
-        (_, Some(DupeAction::Review)) => ("your call", Style::new().fg(th().review)),
-        (_, Some(DupeAction::Keep)) => ("keep as is", muted()),
-        (_, Some(DupeAction::Nothing) | None) => ("shared", muted()),
-    }
+    let Some(a) = action.filter(|_| i > 0) else {
+        return ("keep", accent().bold());
+    };
+    let style = match a {
+        DupeAction::Trash => Style::new().fg(th().caution),
+        DupeAction::StoreOnce => Style::new().fg(th().safe),
+        DupeAction::Review => Style::new().fg(th().review),
+        DupeAction::Keep | DupeAction::Nothing => muted(),
+    };
+    (a.label(), style)
 }
 
 /// Shorten a path to `width` characters by cutting out the middle, so both
@@ -720,13 +722,10 @@ fn draw_dupe_details(f: &mut Frame, app: &App, area: Rect) {
         });
     }
     let sel = &g.copies[app.copy_sel.min(g.copies.len() - 1)];
-    let explain = match (app.copy_sel, sel.action) {
-        (0, _) => "This copy stays as it is. p on another copy keeps that one instead.".to_string(),
-        (_, Some(DupeAction::Trash)) => "Will go to the Trash: a stray copy (named like a copy, or left in Downloads). space to change.".into(),
-        (_, Some(DupeAction::StoreOnce)) => "Will become a clone of the kept copy: both paths keep working, stored once. space to change.".into(),
-        (_, Some(DupeAction::Review)) => "Nothing says which copy is the stray: space to choose.".into(),
-        (_, Some(DupeAction::Keep)) => "Kept as it is, and remembered. space to change.".into(),
-        _ => "Already shares its storage with the kept copy.".into(),
+    let explain = match sel.action.filter(|_| app.copy_sel > 0) {
+        None => "This copy stays as it is. p on another copy keeps that one instead.".to_string(),
+        Some(a @ DupeAction::Nothing) => a.explain().to_string(),
+        Some(a) => format!("{} space to change.", a.explain()),
     };
     lines.push(Line::from(Span::styled(format!("  {explain}"), muted())));
     f.render_widget(Paragraph::new(lines).block(block), area);

@@ -392,6 +392,38 @@ button { font: inherit; color: inherit; }
 .sd-items .i-path { word-break: break-all; -webkit-user-select: text; user-select: text; }
 .sd-items .i-source { color: var(--text-2); white-space: nowrap; }
 
+/* ── Duplicates section ─────────────────────────────────────────────────── */
+
+.tab-count { font-weight: 400; opacity: 0.75; margin-left: 2px; }
+.dp-fill { display: block; height: 100%; border-radius: 2px; background: var(--accent); }
+.dp-sub { color: var(--text-2); font-size: 12px; white-space: nowrap; }
+.dp-progress { display: grid; gap: 8px; min-width: 280px; }
+.dp-progress .meter { width: 280px; }
+.dp-copies { list-style: none; margin: 0; padding: 0; }
+.dp-copy { padding: 12px 0 12px; border-bottom: 1px solid var(--line); display: grid; gap: 6px; }
+.dp-copy-head { display: grid; grid-template-columns: 96px 1fr auto; gap: 12px; align-items: baseline; }
+.dp-role { font-weight: 650; }
+.dp-role.r-keep { color: var(--accent); }
+/* The safety colours are validated as fills; as text they're mixed toward the
+   text colour so they stay readable on light backgrounds too. */
+.dp-role.r-trash { color: color-mix(in oklab, var(--caution) 72%, var(--text)); }
+.dp-role.r-store_once { color: color-mix(in oklab, var(--safe) 80%, var(--text)); }
+.dp-role.r-review { color: color-mix(in oklab, var(--review) 75%, var(--text)); }
+.dp-role.r-keep_as_is, .dp-role.r-nothing { color: var(--text-2); }
+.dp-path { word-break: break-all; white-space: pre-wrap; -webkit-user-select: text; user-select: text; }
+/* Names are shown exactly: runs of spaces matter in paths. */
+#dp-list .sg-title { white-space: pre; }
+.targets .i-path { white-space: pre-wrap; }
+.dp-frees { color: var(--text-2); white-space: nowrap; }
+.dp-copy-body { margin-left: 108px; display: grid; gap: 6px; }
+.dp-explain { color: var(--text-2); margin: 0; }
+.dp-note { color: var(--caution); margin: 0; }
+.dp-controls { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+.dp-controls .seg button[aria-pressed="true"] { background: var(--accent); color: var(--on-accent); font-weight: 600; }
+.folder-options { list-style: none; margin: 8px 0; padding: 0; display: grid; gap: 4px; }
+.folder-options label { display: flex; gap: 8px; align-items: center; padding: 6px 8px; border-radius: 6px; cursor: pointer; word-break: break-all; }
+.folder-options label:hover { background: var(--panel-2); }
+
 /* ── Selection panel (Browse) ───────────────────────────────────────────── */
 
 .side {

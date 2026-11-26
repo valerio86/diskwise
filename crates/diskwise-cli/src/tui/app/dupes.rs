@@ -4,7 +4,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, mpsc};
 
-use diskwise_core::dupes::act::{self, How, Target};
+use diskwise_core::dupes::act::{self, How};
 use diskwise_core::dupes::{self, Action, Copy, DupeProgress, Prefs, prefs};
 
 use super::{App, Modal, ancestors, step};
@@ -37,13 +37,8 @@ pub enum DupeState {
     Unavailable(String),
 }
 
-/// One confirmed step.
-#[derive(Debug, Clone)]
-pub struct PlanItem {
-    pub target: Target,
-    pub how: How,
-    pub bytes: u64,
-}
+/// One confirmed step (shared with the desktop app).
+pub use act::Step as PlanItem;
 
 impl App {
     /// Start (or restart) checking for duplicates in the background.
@@ -167,17 +162,10 @@ impl App {
         }
         let (keeper, copy) = (&g.copies[0], &g.copies[i]);
         if copy.action == Some(Action::Nothing) {
-            self.status = Some(
-                "This copy already shares its storage with the kept one: there's nothing to gain."
-                    .into(),
-            );
+            self.status = Some(Action::Nothing.explain().into());
             return;
         }
-        let mut options = vec![Action::Trash];
-        if dupes::can_store_once(keeper, copy) {
-            options.push(Action::StoreOnce);
-        }
-        options.push(Action::Keep);
+        let options = dupes::choices(keeper, copy);
         let now = copy.action;
         let next = match options.iter().position(|a| Some(*a) == now) {
             Some(p) => options[(p + 1) % options.len()],
@@ -291,34 +279,11 @@ impl App {
         let Some(g) = self.selected_group() else {
             return;
         };
-        let keeper = g.copies[0].path.clone();
-        let plan: Vec<PlanItem> = g.copies[1..]
-            .iter()
-            .filter_map(|c| {
-                let how = match c.action {
-                    Some(Action::Trash) => How::Trash,
-                    Some(Action::StoreOnce) => How::StoreOnce,
-                    _ => return None,
-                };
-                Some(PlanItem {
-                    target: Target {
-                        keeper: keeper.clone(),
-                        copy: c.path.clone(),
-                        folder: g.folder,
-                    },
-                    how,
-                    bytes: c.frees,
-                })
-            })
-            .collect();
-        let undecided = g.copies[1..]
-            .iter()
-            .filter(|c| c.action == Some(Action::Review))
-            .count();
-        if plan.is_empty() {
+        let plan = act::plan(&g.copies, g.folder);
+        if plan.steps.is_empty() {
             self.modal = Some(Modal::Message {
                 title: "Nothing chosen yet".into(),
-                body: if undecided > 0 {
+                body: if plan.undecided > 0 {
                     "The extra copies here are your call: select one with ← → and press space to choose what happens to it.".into()
                 } else {
                     "Nothing in this group is set to change.".into()
@@ -326,20 +291,8 @@ impl App {
             });
             return;
         }
-        let note = (undecided > 0)
-            .then(|| format!("{undecided} undecided copy(ies) are left as they are."));
-        let synced = plan.iter().any(|p| {
-            g.copies
-                .iter()
-                .any(|c| c.path == p.target.copy && c.synced && p.how == How::Trash)
-        });
-        let warning = match (synced, note) {
-            (true, n) => Some(format!(
-                "A copy in a synced folder will be removed on every synced device too.{}",
-                n.map(|n| format!(" {n}")).unwrap_or_default()
-            )),
-            (false, n) => n,
-        };
+        let warning = plan.warning();
+        let plan = plan.steps;
         self.modal = Some(Modal::ConfirmDupes { plan, warning });
     }
 

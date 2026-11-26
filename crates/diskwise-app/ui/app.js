@@ -23,6 +23,8 @@ const state = {
   current: null, // id of the suggestion shown in the Suggestions section
   view: null,
   selected: null, // path of the selected tile in Browse
+  dupes: null, // the Duplicates section's data (see refreshDupes)
+  dupe: null, // id of the duplicate group shown
   highlight: null, // id of the suggestion shown on the map
   mode: "map",
 };
@@ -149,6 +151,7 @@ function showScanning(title) {
   $("scanning").hidden = false;
   $("view-suggestions").hidden = true;
   $("view-browse").hidden = true;
+  $("view-dupes").hidden = true;
   $("main-tabs").hidden = true;
   $("scan-title").textContent = title;
   $("scan-counts").textContent = "";
@@ -176,6 +179,9 @@ listening.push(listen("scan-done", async (done) => {
   state.summary = await invoke("summary");
   state.highlight = null;
   state.current = firstInOrder();
+  // Duplicates are checked in the background from here on.
+  state.dupes = { status: "checking", groups: [] };
+  renderDupes();
   $("scanning").hidden = true;
   $("main-tabs").hidden = false;
   $("rescan").hidden = false;
@@ -208,14 +214,17 @@ function setTab(tab) {
   state.tab = tab;
   $("tab-suggestions").setAttribute("aria-selected", tab === "suggestions");
   $("tab-browse").setAttribute("aria-selected", tab === "browse");
+  $("tab-dupes").setAttribute("aria-selected", tab === "dupes");
   $("view-suggestions").hidden = tab !== "suggestions";
   $("view-browse").hidden = tab !== "browse";
+  $("view-dupes").hidden = tab !== "dupes";
   hideTooltip();
   // The map lays out from its size, which is zero while hidden.
   if (tab === "browse" && state.view) renderBody();
 }
 $("tab-suggestions").addEventListener("click", () => setTab("suggestions"));
 $("tab-browse").addEventListener("click", () => setTab("browse"));
+$("tab-dupes").addEventListener("click", () => setTab("dupes"));
 
 // ── Suggestions section ────────────────────────────────────────────────────
 
@@ -697,6 +706,295 @@ function renderSelected() {
   );
 }
 
+// ── Duplicates section ─────────────────────────────────────────────────────
+//
+// Checked in the background after each scan (and after anything changes).
+// Each extra copy has a chosen action the user can change; "Do it" carries
+// out a group's choices after a confirmation, each step checked again first.
+
+const baseName = (path) => path.replace(/\/$/, "").split("/").pop() || path;
+
+async function refreshDupes() {
+  try {
+    state.dupes = await invoke("dupes");
+  } catch {
+    return;
+  }
+  const groups = state.dupes.groups;
+  if (!groups.some((g) => g.id === state.dupe)) state.dupe = groups[0]?.id ?? null;
+  renderDupes();
+}
+
+function dupeGroup(id) {
+  return state.dupes?.groups.find((g) => g.id === id) ?? null;
+}
+
+function renderDupesTab() {
+  const d = state.dupes;
+  $("dupes-count").textContent = d?.status === "ready" ? `· ${d.groups.length}` : d?.status === "checking" ? "…" : "";
+}
+
+function renderDupesTotals(progress) {
+  const d = state.dupes;
+  if (!d || d.status === "checking" || d.status === "not_started") {
+    const p = progress ?? { done: 0, total: 0 };
+    const pct = p.total ? Math.round((p.done / p.total) * 100) : 0;
+    fill(
+      $("dp-totals"),
+      h(
+        "div",
+        { class: "dp-progress" },
+        h("span", { class: "label" }, p.total ? `Comparing contents: ${bytes(p.done)} of ${bytes(p.total)}` : "Looking for files with the same size…"),
+        h("div", { class: "meter", role: "progressbar", "aria-valuenow": pct, "aria-valuemin": 0, "aria-valuemax": 100 }, h("div", { class: "meter-fill", style: { width: `${pct}%` } })),
+      ),
+    );
+    return;
+  }
+  if (d.status === "unavailable") {
+    fill($("dp-totals"), h("p", { class: "unreadable", style: { margin: 0 } }, d.message));
+    return;
+  }
+  fill(
+    $("dp-totals"),
+    h("div", { class: "total" }, h("span", { class: "amount" }, bytes(d.reclaimable)), h("span", { class: "label" }, "reclaimable from duplicates")),
+    h("div", { class: "total" }, h("span", { class: "amount" }, String(d.groups.length)), h("span", { class: "label" }, "groups of copies")),
+    d.kept || d.shared
+      ? h(
+          "p",
+          { class: "unreadable" },
+          [d.kept ? `${d.kept} kept as they are by your choice.` : null, d.shared ? `${d.shared} already stored once (hard links or clones).` : null].filter(Boolean).join(" "),
+        )
+      : null,
+  );
+}
+
+function renderDupes(progress) {
+  renderDupesTab();
+  renderDupesTotals(progress);
+  const d = state.dupes;
+  const groups = d?.groups ?? [];
+  const largest = Math.max(1, ...groups.map((g) => g.reclaimable));
+  const row = (g) =>
+    h(
+      "button",
+      { type: "button", class: "sg-row", "data-id": g.id, title: g.copies[0].path, "aria-current": g.id === state.dupe ? "true" : null, onclick: () => showDupe(g.id) },
+      h("span", { class: "sg-title" }, baseName(g.copies[0].path), " ", h("span", { class: "dp-sub" }, `· ${g.copies.length} copies`)),
+      h("span", { class: "sg-size" }, bytes(g.reclaimable)),
+      h("span", { class: "sg-bar", "aria-hidden": "true" }, h("span", { class: "dp-fill", style: { width: `${(g.reclaimable / largest) * 100}%` } })),
+    );
+  const section = (title, gs) => (gs.length ? h("section", { class: "sg-group" }, h("h2", {}, title), gs.map(row)) : null);
+  fill(
+    $("dp-list"),
+    d?.status === "ready" && !groups.length ? h("p", { class: "empty", style: { padding: "12px 10px" } }, "No duplicates that would free space.") : null,
+    section("Folders", groups.filter((g) => g.folder)),
+    section("Files", groups.filter((g) => !g.folder)),
+  );
+  renderDupeDetail();
+}
+
+function showDupe(id) {
+  state.dupe = id;
+  for (const row of document.querySelectorAll("#dp-list .sg-row")) {
+    if (row.dataset.id === id) row.setAttribute("aria-current", "true");
+    else row.removeAttribute("aria-current");
+  }
+  renderDupeDetail();
+}
+
+function renderDupeDetail() {
+  const pane = $("dp-detail");
+  const g = dupeGroup(state.dupe);
+  if (!g) {
+    fill(pane, state.dupes?.status === "ready" ? h("p", { class: "empty" }, "Nothing selected.") : null);
+    return;
+  }
+  const live = state.summary?.live;
+  const copy = (c, i) =>
+    h(
+      "li",
+      { class: "dp-copy" },
+      h(
+        "div",
+        { class: "dp-copy-head" },
+        h("span", { class: `dp-role r-${c.action}` }, i === 0 ? "Keep" : c.label[0].toUpperCase() + c.label.slice(1)),
+        h("span", { class: "dp-path" }, g.folder ? `${c.path}/` : c.path),
+        h("span", { class: "dp-frees" }, i === 0 ? "" : c.frees ? `frees ${bytes(c.frees)}` : "frees nothing"),
+      ),
+      h(
+        "div",
+        { class: "dp-copy-body" },
+        h("p", { class: "dp-explain" }, c.explain),
+        c.synced ? h("p", { class: "dp-note" }, "In a synced folder: deleting it removes it on every synced device too.") : null,
+        h(
+          "div",
+          { class: "dp-controls" },
+          c.choices.length
+            ? h(
+                "div",
+                { class: "seg", role: "group", "aria-label": `What happens to ${c.path}` },
+                c.choices.map((ch) =>
+                  h(
+                    "button",
+                    { type: "button", "aria-pressed": ch.action === c.action ? "true" : "false", onclick: () => setDupeAction(g.id, c.path, ch.action) },
+                    ch.label[0].toUpperCase() + ch.label.slice(1),
+                  ),
+                ),
+              )
+            : null,
+          i > 0 ? h("button", { type: "button", class: "link", onclick: () => setKeeper(g.id, c.path) }, "Keep this one instead") : null,
+          h("button", { type: "button", class: "link", onclick: () => invoke("reveal", { path: c.path }).catch((e) => toast(String(e))) }, "Show in Finder"),
+          i > 0 ? h("button", { type: "button", class: "link", onclick: () => chooseIntentional(g.id, c.path) }, "Intentional…") : null,
+        ),
+      ),
+    );
+  fill(
+    pane,
+    h(
+      "header",
+      { class: "sd-head" },
+      h("p", { class: "sd-level" }, g.folder ? `Folder · ${g.files.toLocaleString()} files` : "File", h("span", { class: "sd-meta" }, `${g.copies.length} copies of ${bytes(g.size)}`)),
+      h("h1", {}, baseName(g.copies[0].path)),
+      h("p", { class: "sd-size" }, `${bytes(g.reclaimable)} reclaimable`),
+    ),
+    h(
+      "p",
+      { class: "sd-why" },
+      "The first copy is kept. For each of the others, choose what happens to it: Trash, Store once (replaced by a clone of the kept copy, so both paths keep working while the contents are stored once), or Keep as is.",
+    ),
+    h("ul", { class: "dp-copies" }, g.copies.map(copy)),
+    h(
+      "div",
+      { class: "actions" },
+      h(
+        "button",
+        { type: "button", class: "btn primary", disabled: !live || g.steps === 0 ? true : null, onclick: async () => showDupePlan(g.id, await invoke("dupe_plan", { id: g.id })) },
+        g.steps ? `Do it for ${g.steps} ${g.steps === 1 ? "copy" : "copies"}…` : "Do it…",
+      ),
+      g.undecided ? h("span", { class: "dp-sub" }, `${g.undecided} still your call`) : null,
+    ),
+  );
+}
+
+async function setDupeAction(id, path, action) {
+  try {
+    state.dupes = await invoke("dupe_set_action", { id, path, action });
+    renderDupes();
+  } catch (e) {
+    toast(String(e));
+  }
+}
+
+async function setKeeper(id, path) {
+  try {
+    const r = await invoke("dupe_set_keeper", { id, path });
+    await refreshDupes();
+    if (r.offer) offerFolderOrder(r.offer);
+  } catch (e) {
+    toast(String(e));
+  }
+}
+
+function offerFolderOrder(offer) {
+  const dialog = $("dialog");
+  $("dialog-title").textContent = "Remember this?";
+  fill(
+    $("dialog-body"),
+    h("p", {}, "Always keep copies in"),
+    h("p", { class: "dp-path" }, h("strong", {}, offer.prefer)),
+    h("p", {}, "over copies in"),
+    h("p", { class: "dp-path" }, h("strong", {}, offer.over)),
+  );
+  fill($("dialog-actions"), h("button", { class: "btn", value: "once" }, "Just this time"), h("button", { class: "btn primary", value: "always" }, "Always"));
+  dialog.returnValue = "";
+  dialog.onclose = async () => {
+    if (dialog.returnValue !== "always") return;
+    try {
+      await invoke("dupe_prefer_folder", offer);
+      toast("Saved. Checking duplicates again…");
+    } catch (e) {
+      toast(String(e));
+    }
+  };
+  dialog.showModal();
+}
+
+async function chooseIntentional(id, path) {
+  const options = await invoke("dupe_folder_options", { id, path });
+  if (!options.length) return toast("There's no folder here to mark.");
+  const dialog = $("dialog");
+  $("dialog-title").textContent = "Intentional duplicates";
+  fill(
+    $("dialog-body"),
+    h("p", {}, "Which folder's duplicates are intentional? Copies inside it are kept as they are and no longer suggested."),
+    h(
+      "ul",
+      { class: "folder-options" },
+      options.map((o, i) => h("li", {}, h("label", {}, h("input", { type: "radio", name: "folder", value: o, checked: i === 0 ? true : null }), o))),
+    ),
+  );
+  fill($("dialog-actions"), h("button", { class: "btn", value: "cancel" }, "Cancel"), h("button", { class: "btn primary", value: "mark" }, "Mark as intentional"));
+  dialog.returnValue = "";
+  dialog.onclose = async () => {
+    if (dialog.returnValue !== "mark") return;
+    const folder = dialog.querySelector('input[name="folder"]:checked')?.value;
+    if (!folder) return;
+    try {
+      await invoke("dupe_mark_intentional", { folder });
+      toast(`Duplicates in ${folder} are now kept as they are.`);
+    } catch (e) {
+      toast(String(e));
+    }
+  };
+  dialog.showModal();
+}
+
+function showDupePlan(id, plan) {
+  const dialog = $("dialog");
+  if (plan.type === "refuse") {
+    $("dialog-title").textContent = plan.title;
+    fill($("dialog-body"), h("p", {}, plan.body));
+    fill($("dialog-actions"), h("button", { class: "btn primary", value: "ok" }, "OK"));
+    dialog.onclose = null;
+    dialog.showModal();
+    return;
+  }
+  const label = { trash: "Trash", store_once: "Store once" };
+  $("dialog-title").textContent = "Deal with these copies?";
+  fill(
+    $("dialog-body"),
+    h(
+      "ul",
+      { class: "targets" },
+      h("li", {}, h("span", { class: "i-size dp-role r-keep" }, "Keep"), h("span", { class: "i-path" }, plan.keeper)),
+      plan.steps.map((s) => h("li", {}, h("span", { class: `i-size dp-role r-${s.how}` }, label[s.how]), h("span", { class: "i-path" }, `${s.target.copy}  ·  ${bytes(s.bytes)}`))),
+    ),
+    h("p", {}, `${bytes(plan.total)} freed in total. Each copy is checked again first: it must still match the kept one exactly. Copies moved to the Trash can be taken back out until it's emptied.`),
+    plan.warning ? h("p", { class: "warning" }, plan.warning) : null,
+  );
+  fill($("dialog-actions"), h("button", { class: "btn", value: "cancel" }, "Cancel"), h("button", { class: "btn danger", value: "go" }, "Go ahead"));
+  dialog.returnValue = "";
+  dialog.onclose = async () => {
+    if (dialog.returnValue !== "go") return;
+    const result = await invoke("dupe_apply", { id });
+    toast(result.failures.length ? `${result.message} ${result.failures.join("; ")}` : result.message);
+    state.summary = await invoke("summary");
+    if (state.current === null || !finding(state.current)) state.current = firstInOrder();
+    renderDisk();
+    renderSuggestions();
+    await navigate(state.view.path);
+    await refreshDupes();
+  };
+  dialog.showModal();
+}
+
+listening.push(listen("dupes-progress", (p) => {
+  if (state.dupes?.status === "ready") state.dupes = { ...state.dupes, status: "checking" };
+  if (!state.dupes) state.dupes = { status: "checking", groups: [] };
+  renderDupesTab();
+  renderDupesTotals(p);
+}));
+listening.push(listen("dupes-done", () => refreshDupes()));
+
 // ── Dialogs ────────────────────────────────────────────────────────────────
 
 function showPlan(plan) {
@@ -739,10 +1037,23 @@ function showPlan(plan) {
 
 document.addEventListener("keydown", (e) => {
   if ($("dialog").open || !$("scanning").hidden) return;
-  // ⌘1 / ⌘2 switch sections.
-  if (e.metaKey && (e.key === "1" || e.key === "2")) {
+  // ⌘1 / ⌘2 / ⌘3 switch sections.
+  if (e.metaKey && ["1", "2", "3"].includes(e.key)) {
     e.preventDefault();
-    setTab(e.key === "1" ? "suggestions" : "browse");
+    setTab({ 1: "suggestions", 2: "browse", 3: "dupes" }[e.key]);
+    return;
+  }
+  if (state.tab === "dupes") {
+    if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+      e.preventDefault();
+      const ids = [...document.querySelectorAll("#dp-list .sg-row")].map((r) => r.dataset.id);
+      const i = ids.indexOf(state.dupe);
+      const next = ids[Math.max(0, Math.min(ids.length - 1, i + (e.key === "ArrowDown" ? 1 : -1)))];
+      if (next !== undefined) {
+        showDupe(next);
+        document.querySelector(`#dp-list .sg-row[data-id="${CSS.escape(next)}"]`)?.scrollIntoView({ block: "nearest" });
+      }
+    }
     return;
   }
   if (state.tab === "suggestions") {

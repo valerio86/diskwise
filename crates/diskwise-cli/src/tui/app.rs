@@ -576,6 +576,7 @@ impl App {
                 Ok(()) => {
                     self.remove_from_tree(&t.path);
                     self.remove_from_findings(&t.path, t.bytes);
+                    diskwise_core::dupes::forget(&mut self.snap, &t.path);
                     moved += t.bytes;
                     moved_count += 1;
                 }

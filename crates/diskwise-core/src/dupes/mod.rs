@@ -49,6 +49,12 @@ pub(crate) fn is_sync_marker(name: &str) -> bool {
     ) || ((name.starts_with(".sync_") || name.starts_with("._sync_")) && name.ends_with(".db"))
 }
 
+/// Drop duplicate candidates at or inside `path` (after it was moved to the Trash).
+pub fn forget(snap: &mut Snapshot, path: &str) {
+    snap.large_files
+        .retain(|f| f.path != path && !inside(&f.path, path));
+}
+
 /// What `rank` needs to know besides the copies themselves.
 pub(crate) struct Ctx<'a> {
     pub prefs: &'a Prefs,
@@ -623,6 +629,48 @@ pub fn set_keeper(copies: &mut [Copy], index: usize, prefs: &Prefs, snap: &Snaps
     };
     assign_actions(copies, &ctx);
     reclaimable(copies)
+}
+
+/// What the user can choose for an extra copy, in the order a "change" cycles
+/// through them. Empty when the copy already shares the keeper's storage.
+pub fn choices(keeper: &Copy, copy: &Copy) -> Vec<Action> {
+    if copy.action == Some(Action::Nothing) {
+        return Vec::new();
+    }
+    let mut out = vec![Action::Trash];
+    if can_store_once(keeper, copy) {
+        out.push(Action::StoreOnce);
+    }
+    out.push(Action::Keep);
+    out
+}
+
+impl Action {
+    /// A short label for lists.
+    pub fn label(self) -> &'static str {
+        match self {
+            Action::Trash => "trash",
+            Action::StoreOnce => "store once",
+            Action::Review => "your call",
+            Action::Keep => "keep as is",
+            Action::Nothing => "shared",
+        }
+    }
+
+    /// What will happen to a copy with this action, in a sentence.
+    pub fn explain(self) -> &'static str {
+        match self {
+            Action::Trash => {
+                "Goes to the Trash: a stray copy (named like a copy, or left in Downloads)."
+            }
+            Action::StoreOnce => {
+                "Becomes a clone of the kept copy: both paths keep working, and the contents are stored once."
+            }
+            Action::Review => "Nothing says which copy is the stray, so it's your call.",
+            Action::Keep => "Kept as it is, and remembered for next time.",
+            Action::Nothing => "Already shares its storage with the kept copy: nothing to gain.",
+        }
+    }
 }
 
 /// Whether "store once" is possible for `copy` against `keeper`.

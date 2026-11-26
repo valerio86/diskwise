@@ -135,6 +135,8 @@ fn handle_key(app: &mut App, key: KeyEvent) {
                 if yes {
                     app.status =
                         Some(app.apply_trash(targets, diskwise_core::actions::move_to_trash));
+                    // What's left may have changed: check duplicates again.
+                    app.start_dupes();
                 } else if no {
                     app.status = Some("Cancelled.".into())
                 } else {

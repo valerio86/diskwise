@@ -20,6 +20,7 @@
       <div class="seg main-tabs" role="tablist" aria-label="Sections" id="main-tabs" hidden>
         <button role="tab" id="tab-suggestions" aria-selected="true" type="button">Suggestions</button>
         <button role="tab" id="tab-browse" aria-selected="false" type="button">Browse</button>
+        <button role="tab" id="tab-dupes" aria-selected="false" type="button">Duplicates <span class="tab-count" id="dupes-count"></span></button>
       </div>
       <div class="disk" id="disk" hidden>
         <div class="meter" role="img" id="disk-meter"><div class="meter-fill" id="disk-fill"></div></div>
@@ -34,6 +35,16 @@
       <div class="sg-body">
         <nav class="sg-list" id="sg-list" aria-label="Suggestions"></nav>
         <article class="sg-detail" id="sg-detail" aria-live="polite"></article>
+      </div>
+    </main>
+
+    <!-- Duplicates: copies of the same folders and files, checked in the background
+         after the scan. Groups on the left, the chosen group's copies on the right. -->
+    <main class="suggestions" id="view-dupes" hidden>
+      <div class="totals" id="dp-totals"></div>
+      <div class="sg-body">
+        <nav class="sg-list" id="dp-list" aria-label="Duplicates"></nav>
+        <article class="sg-detail" id="dp-detail" aria-live="polite"></article>
       </div>
     </main>
 
