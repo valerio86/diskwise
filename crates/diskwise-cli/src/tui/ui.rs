@@ -1,4 +1,8 @@
 //! Drawing. Everything here reads `App`; nothing changes state.
+//!
+//! The look follows Claude Code's own dialogs: brand and tabs on one line with
+//! the active tab filled in the accent colour, bold headings with muted detail
+//! lines instead of boxes, and bars drawn as an accent fill on a slate track.
 
 use std::time::Duration;
 
@@ -7,34 +11,72 @@ use diskwise_core::scan::ScanProgress;
 use diskwise_core::{Finding, NodeKind, human_bytes};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Flex, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style, Stylize};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Cell, Clear, Paragraph, Row, Table, TableState, Wrap};
+use ratatui::widgets::{
+    Block, BorderType, Borders, Cell, Clear, HighlightSpacing, Paragraph, Row, Table, TableState,
+    Wrap,
+};
 
 use super::app::{App, Modal, Tab};
+use super::theme::th;
 
-const DETAILS_HEIGHT: u16 = 9;
+const DETAILS_HEIGHT: u16 = 8;
+const BAR_WIDTH: usize = 12;
 
 pub fn safety_style(s: Safety) -> Style {
-    match s {
-        Safety::Safe => Style::new().fg(Color::Green),
-        Safety::Caution => Style::new().fg(Color::Yellow),
-        Safety::Review => Style::new().fg(Color::Cyan),
+    Style::new().fg(match s {
+        Safety::Safe => th().safe,
+        Safety::Caution => th().caution,
+        Safety::Review => th().review,
+    })
+}
+
+fn muted() -> Style {
+    Style::new().fg(th().muted)
+}
+
+fn accent() -> Style {
+    Style::new().fg(th().accent)
+}
+
+/// A section separator with a bold heading: `── Details ─────`.
+fn section(title: &str) -> Block<'static> {
+    Block::new()
+        .borders(Borders::TOP)
+        .border_type(BorderType::Plain)
+        .border_style(Style::new().fg(th().rule))
+        .title(Span::styled(format!(" {title} "), Style::new().bold()))
+        .title_style(Style::new().fg(ratatui::style::Color::Reset))
+        .padding(ratatui::widgets::Padding::horizontal(1))
+}
+
+/// Key hints: the key in the accent colour, its label muted.
+fn key_hints(pairs: &[(&str, &str)]) -> Vec<Span<'static>> {
+    let mut spans = vec![Span::raw(" ")];
+    for (i, (key, label)) in pairs.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw("   "));
+        }
+        spans.push(Span::styled(key.to_string(), accent().bold()));
+        spans.push(Span::styled(format!(" {label}"), muted()));
     }
+    spans
 }
 
 pub fn draw(f: &mut Frame, app: &App) {
-    let [header, tabs, main, details, footer] = Layout::vertical([
+    let [tabs, _, location, main, details, footer] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(1),
-        Constraint::Min(5),
+        Constraint::Length(2),
+        Constraint::Min(4),
         Constraint::Length(DETAILS_HEIGHT),
         Constraint::Length(1),
     ])
     .areas(f.area());
 
-    draw_header(f, app, header);
     draw_tabs(f, app, tabs);
+    draw_location(f, app, location);
     match app.tab {
         Tab::Browse => {
             draw_browser(f, app, main);
@@ -51,41 +93,13 @@ pub fn draw(f: &mut Frame, app: &App) {
     }
 }
 
-fn draw_header(f: &mut Frame, app: &App, area: Rect) {
-    let disk = app.snap.system.as_ref().and_then(|s| {
-        let (cap, free) = match &s.container {
-            Some(c) => (c.capacity, c.free),
-            None => s.filesystem.map(|u| (u.capacity, u.free))?,
-        };
-        let used = cap.saturating_sub(free);
-        Some(format!(
-            "{} free of {} ({:.0}% full)",
-            human_bytes(free),
-            human_bytes(cap),
-            used as f64 / cap.max(1) as f64 * 100.0
-        ))
-    });
-    let [left, right] =
-        Layout::horizontal([Constraint::Min(10), Constraint::Length(40)]).areas(area);
-    f.render_widget(
-        Line::from(vec![
-            Span::styled(" diskwise ", Style::new().bold().reversed()),
-            Span::raw("  "),
-            Span::styled(app.current_path(), Style::new().bold()),
-        ]),
-        left,
-    );
-    if let Some(d) = disk {
-        f.render_widget(Line::from(d).right_aligned().dim(), right);
-    }
-}
-
+/// `diskwise   Browse   Suggestions · 24          20.5 GB cleanable now`
 fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
     let tab = |label: String, active: bool| {
         if active {
-            Span::styled(format!(" {label} "), Style::new().bold().reversed())
+            Span::styled(format!(" {label} "), th().filled(th().accent))
         } else {
-            Span::raw(format!(" {label} ")).dim()
+            Span::styled(format!(" {label} "), Style::new().bold())
         }
     };
     let cleanable: u64 = app
@@ -94,50 +108,147 @@ fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
         .filter(|f| f.reclaimable() && f.safety != Safety::Review)
         .map(|f| f.bytes)
         .sum();
+    let [left, right] =
+        Layout::horizontal([Constraint::Min(30), Constraint::Length(30)]).areas(area);
     f.render_widget(
         Line::from(vec![
+            Span::styled(" diskwise ", accent().bold()),
+            Span::raw("  "),
             tab("Browse".into(), app.tab == Tab::Browse),
-            Span::raw(" "),
+            Span::raw("  "),
             tab(
-                format!("Suggestions ({})", app.findings.len()),
+                format!("Suggestions · {}", app.findings.len()),
                 app.tab == Tab::Suggestions,
             ),
-            Span::raw("   "),
-            Span::styled(
-                format!(
-                    "{} can be cleaned up safely or with a quick step",
-                    human_bytes(cleanable)
-                ),
-                Style::new().fg(Color::Green),
-            ),
+            Span::styled("   tab to switch", muted()),
         ]),
-        area,
+        left,
+    );
+    f.render_widget(
+        Line::from(vec![
+            Span::styled(human_bytes(cleanable), Style::new().fg(th().safe).bold()),
+            Span::styled(" cleanable now ", muted()),
+        ])
+        .right_aligned(),
+        right,
     );
 }
 
-/// A 10-cell bar using eighth blocks for sub-cell precision.
-fn bar(fraction: f64, width: usize) -> String {
-    const PARTS: [&str; 8] = [" ", "▏", "▎", "▍", "▌", "▋", "▊", "▉"];
-    let eighths = (fraction.clamp(0.0, 1.0) * (width * 8) as f64).round() as usize;
-    let mut s = "█".repeat(eighths / 8);
-    if !eighths.is_multiple_of(8) {
-        s.push_str(PARTS[eighths % 8]);
+/// Bold heading (where we are) with a muted line under it (what's here), plus the
+/// disk's fill level on the right as a bar, like Claude Code's usage meters.
+fn draw_location(f: &mut Frame, app: &App, area: Rect) {
+    let [left, right] = Layout::horizontal([
+        Constraint::Min(20),
+        Constraint::Length(BAR_WIDTH as u16 + 28),
+    ])
+    .areas(area);
+    let (title, subtitle) = match app.tab {
+        Tab::Browse => {
+            let dir = app.current_dir();
+            (
+                app.current_path(),
+                format!(
+                    "{} · {} files · sorted by {}",
+                    human_bytes(dir.allocated),
+                    dir.files,
+                    app.sort.label()
+                ),
+            )
+        }
+        Tab::Suggestions => (
+            "What you could clean up".to_string(),
+            "Safest first · ⏎ shows an item in the browser".to_string(),
+        ),
+    };
+    f.render_widget(
+        Paragraph::new(vec![
+            Line::from(Span::styled(format!(" {title}"), Style::new().bold())),
+            Line::from(Span::styled(format!(" {subtitle}"), muted())),
+        ]),
+        left,
+    );
+
+    let disk = app.snap.system.as_ref().and_then(|s| match &s.container {
+        Some(c) => Some((c.capacity, c.free)),
+        None => s.filesystem.map(|u| (u.capacity, u.free)),
+    });
+    if let Some((cap, free)) = disk {
+        let used = cap.saturating_sub(free);
+        let frac = used as f64 / cap.max(1) as f64;
+        let mut bar_line = bar(frac, BAR_WIDTH);
+        bar_line.push(Span::styled(
+            format!(" {:.0}% full", frac * 100.0),
+            Style::new().bold(),
+        ));
+        f.render_widget(
+            Paragraph::new(vec![
+                Line::from(bar_line).right_aligned(),
+                Line::from(Span::styled(
+                    format!("{} free of {} ", human_bytes(free), human_bytes(cap)),
+                    muted(),
+                ))
+                .right_aligned(),
+            ]),
+            right,
+        );
     }
-    format!("{s:<width$}")
+}
+
+/// A bar as an accent fill on a slate track, with eighth-block precision at the
+/// edge. Colours are set per span (including background), so the bar looks the
+/// same on the selected row.
+fn bar(fraction: f64, width: usize) -> Vec<Span<'static>> {
+    const PARTS: [&str; 8] = [" ", "▏", "▎", "▍", "▌", "▋", "▊", "▉"];
+    if !th().has_color() {
+        let full = (fraction.clamp(0.0, 1.0) * width as f64).round() as usize;
+        return vec![Span::raw(format!(
+            "{}{}",
+            "█".repeat(full),
+            "░".repeat(width - full)
+        ))];
+    }
+    let eighths = (fraction.clamp(0.0, 1.0) * (width * 8) as f64).round() as usize;
+    let full = eighths / 8;
+    let mut spans = vec![Span::styled(" ".repeat(full), Style::new().bg(th().accent))];
+    let mut used = full;
+    if !eighths.is_multiple_of(8) {
+        spans.push(Span::styled(
+            PARTS[eighths % 8],
+            Style::new().fg(th().accent).bg(th().track),
+        ));
+        used += 1;
+    }
+    spans.push(Span::styled(
+        " ".repeat(width.saturating_sub(used)),
+        Style::new().bg(th().track),
+    ));
+    spans
+}
+
+/// Selection is drawn as the selected row's base style (see `Theme::selected`),
+/// so the highlight itself only adds the pointer.
+fn selection_table<'a>(table: Table<'a>) -> Table<'a> {
+    table
+        .row_highlight_style(Style::new())
+        .highlight_symbol(Span::styled("❯ ", accent().bold()))
+        .highlight_spacing(HighlightSpacing::Always)
+        .column_spacing(2)
 }
 
 fn draw_browser(f: &mut Frame, app: &App, area: Rect) {
-    let dir = app.current_dir();
-    let total = dir.allocated.max(1);
+    let total = app.current_dir().allocated.max(1);
     let rows: Vec<Row> = app
         .entries()
         .iter()
-        .map(|e| {
+        .enumerate()
+        .map(|(i, e)| {
             let frac = e.allocated as f64 / total as f64;
             let name = match e.kind {
                 NodeKind::Dir => Span::styled(format!("{}/", e.name), Style::new().bold()),
                 NodeKind::File => Span::raw(e.name.clone()),
-                NodeKind::Rest => Span::raw(format!("({} smaller items)", e.files + e.dirs)).dim(),
+                NodeKind::Rest => {
+                    Span::styled(format!("({} smaller items)", e.files + e.dirs), muted())
+                }
             };
             let tag = app
                 .entry_path(e)
@@ -145,49 +256,49 @@ fn draw_browser(f: &mut Frame, app: &App, area: Rect) {
                 .unwrap_or_default();
             Row::new(vec![
                 Cell::from(Line::from(human_bytes(e.allocated)).right_aligned()),
-                Cell::from(bar(frac, 10)).fg(Color::Blue),
-                Cell::from(Line::from(format!("{:.1}%", frac * 100.0)).right_aligned()).dim(),
+                Cell::from(Line::from(bar(frac, BAR_WIDTH))),
+                Cell::from(Line::from(format!("{:.1}%", frac * 100.0)).right_aligned())
+                    .style(muted()),
                 Cell::from(name),
                 Cell::from(tag),
             ])
+            .style(if i == app.selected {
+                th().selected()
+            } else {
+                Style::new()
+            })
         })
         .collect();
     let table = Table::new(
         rows,
         [
             Constraint::Length(9),
-            Constraint::Length(10),
+            Constraint::Length(BAR_WIDTH as u16),
             Constraint::Length(6),
             Constraint::Fill(3),
             Constraint::Fill(2),
         ],
-    )
-    .block(Block::bordered().title(format!(
-        " {} · {} files · sorted by {} ",
-        human_bytes(dir.allocated),
-        dir.files,
-        app.sort.label()
-    )))
-    .row_highlight_style(Style::new().reversed())
-    .column_spacing(1);
+    );
     let mut state = TableState::default().with_selected(Some(app.selected));
-    f.render_stateful_widget(table, area, &mut state);
+    f.render_stateful_widget(selection_table(table), area, &mut state);
 }
 
 /// Right-hand tag for a browser row: the suggestion covering it, or how much is
 /// cleanable inside a folder.
 fn tag_for(app: &App, path: &str, kind: NodeKind) -> Line<'static> {
     if let Some(c) = app.coverage(path).filter(|c| c.direct) {
+        let style = safety_style(c.finding.safety);
         return Line::from(vec![
-            Span::styled("● ", safety_style(c.finding.safety)),
-            Span::styled(c.finding.title.clone(), safety_style(c.finding.safety)),
+            Span::styled("● ", style),
+            Span::styled(c.finding.title.clone(), style),
         ]);
     }
     let inside = app.cleanable_below(path);
     if kind == NodeKind::Dir && inside > 0 {
-        return Line::from(format!("{} cleanable inside", human_bytes(inside)))
-            .fg(Color::Green)
-            .dim();
+        return Line::from(vec![
+            Span::styled(human_bytes(inside), Style::new().fg(th().safe)),
+            Span::styled(" cleanable inside", muted()),
+        ]);
     }
     Line::default()
 }
@@ -209,30 +320,35 @@ fn age(newest_mtime: i64, now: i64) -> String {
 fn finding_lines(f: &Finding) -> Vec<Line<'static>> {
     let mut lines = vec![
         Line::from(vec![
-            Span::styled(format!("{} ", f.safety), safety_style(f.safety).bold()),
+            Span::styled(format!("● {} ", f.safety), safety_style(f.safety).bold()),
             Span::styled(f.title.clone(), Style::new().bold()),
-            Span::raw(format!("   [{} · {}]", f.category, f.action)).dim(),
+            Span::styled(format!("   {} · {}", f.category, f.action), muted()),
         ]),
         Line::from(f.why.clone()),
-        Line::from(format!("→ {}", f.how)),
+        Line::from(vec![
+            Span::styled("→ ", accent().bold()),
+            Span::raw(f.how.clone()),
+        ]),
     ];
     if let Some(p) = &f.prevent {
-        lines.push(Line::from(format!("Prevent: {p}")).dim());
+        lines.push(Line::from(vec![
+            Span::styled("Prevent: ", muted()),
+            Span::styled(p.clone(), muted()),
+        ]));
     }
     lines
 }
 
 fn draw_entry_details(f: &mut Frame, app: &App, area: Rect) {
-    let block = Block::bordered().title(" Details ");
+    let block = section("Details");
     let Some(e) = app.selected_node() else {
-        f.render_widget(Paragraph::new("Empty folder.").block(block), area);
+        f.render_widget(Paragraph::new(" Empty folder.").block(block), area);
         return;
     };
     let now = app.snap.scanned_at;
     let mut lines = Vec::new();
     match app.entry_path(e) {
         Some(path) => {
-            lines.push(Line::from(path.clone()).bold());
             let mut facts = format!("{} on disk", human_bytes(e.allocated));
             if e.kind == NodeKind::Dir {
                 facts.push_str(&format!(" · {} files · {} folders", e.files, e.dirs));
@@ -241,22 +357,32 @@ fn draw_entry_details(f: &mut Frame, app: &App, area: Rect) {
             if e.incomplete {
                 facts.push_str(" · partly unreadable");
             }
-            lines.push(Line::from(facts).dim());
+            lines.push(Line::from(Span::styled(path.clone(), Style::new().bold())));
+            lines.push(Line::from(Span::styled(facts, muted())));
             match app.coverage(&path) {
                 Some(c) if c.direct => lines.extend(finding_lines(c.finding)),
                 Some(c) => lines.push(Line::from(vec![
                     Span::raw("Inside "),
                     Span::styled(c.finding.title.clone(), safety_style(c.finding.safety)),
-                    Span::raw(format!(" ({}): {}", c.finding.safety, c.finding.how)),
+                    Span::styled(
+                        format!(" ({}): {}", c.finding.safety, c.finding.how),
+                        muted(),
+                    ),
                 ])),
-                None => lines.push(Line::from("No suggestion covers this item.").dim()),
+                None => lines.push(Line::from(Span::styled(
+                    "No suggestion covers this item.",
+                    muted(),
+                ))),
             }
         }
-        None => lines.push(Line::from(format!(
-            "{} files and {} folders, each smaller than {}.",
-            e.files,
-            e.dirs,
-            human_bytes(app.snap.min_node_size)
+        None => lines.push(Line::from(Span::styled(
+            format!(
+                "{} files and {} folders, each smaller than {}.",
+                e.files,
+                e.dirs,
+                human_bytes(app.snap.min_node_size)
+            ),
+            muted(),
         ))),
     }
     f.render_widget(
@@ -283,7 +409,8 @@ fn draw_suggestions(f: &mut Frame, app: &App, area: Rect) {
     let rows: Vec<Row> = app
         .findings
         .iter()
-        .map(|fd| {
+        .enumerate()
+        .map(|(i, fd)| {
             let size = if fd.size_known {
                 human_bytes(fd.bytes)
             } else {
@@ -296,34 +423,39 @@ fn draw_suggestions(f: &mut Frame, app: &App, area: Rect) {
             };
             Row::new(vec![
                 Cell::from(Line::from(size).right_aligned()),
-                Cell::from(fd.safety.to_string()).style(safety_style(fd.safety)),
+                Cell::from(Line::from(vec![
+                    Span::styled("● ", safety_style(fd.safety)),
+                    Span::styled(fd.safety.to_string(), safety_style(fd.safety)),
+                ])),
                 Cell::from(fd.title.clone()),
-                Cell::from(fd.action.to_string()).dim(),
-                Cell::from(location).dim(),
+                Cell::from(Span::styled(fd.action.to_string(), muted())),
+                Cell::from(Span::styled(location, muted())),
             ])
+            .style(if i == app.suggestion {
+                th().selected()
+            } else {
+                Style::new()
+            })
         })
         .collect();
     let table = Table::new(
         rows,
         [
             Constraint::Length(9),
-            Constraint::Length(7),
-            Constraint::Fill(3),
+            Constraint::Length(9),
+            Constraint::Length(36),
             Constraint::Length(20),
-            Constraint::Fill(4),
+            Constraint::Fill(1),
         ],
-    )
-    .block(Block::bordered().title(" Suggestions · safest first "))
-    .row_highlight_style(Style::new().reversed())
-    .column_spacing(1);
+    );
     let mut state = TableState::default().with_selected(Some(app.suggestion));
-    f.render_stateful_widget(table, area, &mut state);
+    f.render_stateful_widget(selection_table(table), area, &mut state);
 }
 
 fn draw_suggestion_details(f: &mut Frame, app: &App, area: Rect) {
-    let block = Block::bordered().title(" Details ");
+    let block = section("Details");
     let Some(fd) = app.selected_finding() else {
-        f.render_widget(Paragraph::new("No suggestions.").block(block), area);
+        f.render_widget(Paragraph::new(" No suggestions.").block(block), area);
         return;
     };
     let mut lines = finding_lines(fd);
@@ -333,17 +465,20 @@ fn draw_suggestion_details(f: &mut Frame, app: &App, area: Rect) {
             .as_ref()
             .map(|h| format!("  (from {h})"))
             .unwrap_or_default();
-        lines.push(
-            Line::from(format!(
+        lines.push(Line::from(Span::styled(
+            format!(
                 "  {:>9}  {}{from}",
                 human_bytes(item.bytes),
                 tilde(&item.path)
-            ))
-            .dim(),
-        );
+            ),
+            muted(),
+        )));
     }
     if fd.items.len() > 3 {
-        lines.push(Line::from(format!("  … and {} more", fd.items.len() - 3)).dim());
+        lines.push(Line::from(Span::styled(
+            format!("  … and {} more", fd.items.len() - 3),
+            muted(),
+        )));
     }
     f.render_widget(
         Paragraph::new(lines)
@@ -355,18 +490,27 @@ fn draw_suggestion_details(f: &mut Frame, app: &App, area: Rect) {
 
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     let line = match &app.status {
-        Some(s) => Line::from(s.clone()).fg(Color::Yellow),
-        None => {
-            let keys = match app.tab {
-                Tab::Browse => {
-                    "↑↓ move  ⏎/→ open  ← up  tab suggestions  d trash  s sort  r rescan  ? help  q quit"
-                }
-                Tab::Suggestions => {
-                    "↑↓ move  ⏎ show in browser  tab browse  d trash all  r rescan  ? help  q quit"
-                }
-            };
-            Line::from(keys).dim()
-        }
+        Some(s) => Line::from(Span::styled(format!(" {s}"), Style::new().fg(th().caution))),
+        None => Line::from(match app.tab {
+            Tab::Browse => key_hints(&[
+                ("↑↓", "move"),
+                ("⏎", "open"),
+                ("←", "up"),
+                ("d", "trash"),
+                ("s", "sort"),
+                ("r", "rescan"),
+                ("?", "help"),
+                ("q", "quit"),
+            ]),
+            Tab::Suggestions => key_hints(&[
+                ("↑↓", "move"),
+                ("⏎", "show in browser"),
+                ("d", "trash all"),
+                ("r", "rescan"),
+                ("?", "help"),
+                ("q", "quit"),
+            ]),
+        }),
     };
     f.render_widget(line, area);
 }
@@ -381,71 +525,93 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
     v
 }
 
+fn key_pill(key: &str, bg: ratatui::style::Color) -> Span<'static> {
+    Span::styled(format!(" {key} "), th().filled(bg))
+}
+
 fn draw_modal(f: &mut Frame, modal: &Modal) {
     let (title, text, border) = match modal {
-        Modal::Help => (
-            " Keys ".to_string(),
-            Text::from(vec![
-                Line::from("↑ ↓  j k        move            PgUp PgDn   move faster"),
-                Line::from("⏎ → l           open folder / show suggestion in browser"),
-                Line::from("← h Backspace   up one folder"),
-                Line::from("Tab             switch Browse / Suggestions"),
-                Line::from("d Delete        move to Trash (asks first, never deletes outright)"),
-                Line::from("s               sort: size → name → oldest first"),
-                Line::from("r               rescan"),
-                Line::from("q Esc           quit"),
-                Line::from(""),
+        Modal::Help => {
+            let row = |keys: &str, what: &str| {
                 Line::from(vec![
-                    Span::styled("● safe", safety_style(Safety::Safe)),
-                    Span::raw(" nothing is lost   "),
-                    Span::styled("● caution", safety_style(Safety::Caution)),
-                    Span::raw(" safe after a quick step   "),
-                    Span::styled("● review", safety_style(Safety::Review)),
-                    Span::raw(" your call"),
+                    Span::styled(format!("{keys:<16}"), accent().bold()),
+                    Span::raw(what.to_string()),
+                ])
+            };
+            (
+                "Keys".to_string(),
+                Text::from(vec![
+                    row("tab  1  2", "switch between Browse and Suggestions"),
+                    row("↑ ↓  j k", "move (PgUp / PgDn move faster)"),
+                    row("⏎ → l", "open folder · show suggestion in the browser"),
+                    row("← h ⌫", "up one folder"),
+                    row("d", "move to Trash (asks first, never deletes outright)"),
+                    row("s", "sort: size → name → oldest first"),
+                    row("r", "rescan"),
+                    row("q esc", "quit"),
+                    Line::from(""),
+                    Line::from(vec![
+                        Span::styled("● safe", safety_style(Safety::Safe)),
+                        Span::styled(" nothing is lost    ", muted()),
+                        Span::styled("● caution", safety_style(Safety::Caution)),
+                        Span::styled(" safe after a quick step    ", muted()),
+                        Span::styled("● review", safety_style(Safety::Review)),
+                        Span::styled(" your call", muted()),
+                    ]),
                 ]),
-            ]),
-            Color::Reset,
-        ),
+                th().accent,
+            )
+        }
         Modal::Message { title, body } => (
-            format!(" {title} "),
+            title.clone(),
             Text::from(
                 body.lines()
                     .map(|l| Line::from(l.to_string()))
                     .collect::<Vec<_>>(),
             ),
-            Color::Cyan,
+            th().accent,
         ),
         Modal::ConfirmTrash { targets, warning } => {
             let total: u64 = targets.iter().map(|t| t.bytes).sum();
             let mut lines = Vec::new();
             for t in targets.iter().take(8) {
-                lines.push(Line::from(format!(
-                    "{:>9}  {}",
-                    human_bytes(t.bytes),
-                    t.path
-                )));
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("{:>9}  ", human_bytes(t.bytes)),
+                        Style::new().bold(),
+                    ),
+                    Span::raw(t.path.clone()),
+                ]));
             }
             if targets.len() > 8 {
-                lines
-                    .push(Line::from(format!("           … and {} more", targets.len() - 8)).dim());
+                lines.push(Line::from(Span::styled(
+                    format!("           … and {} more", targets.len() - 8),
+                    muted(),
+                )));
             }
             lines.push(Line::from(""));
-            lines.push(Line::from(format!("{} in total.", human_bytes(total))).bold());
+            lines.push(Line::from(Span::styled(
+                format!("{} in total", human_bytes(total)),
+                Style::new().bold(),
+            )));
             if let Some(w) = warning {
                 lines.push(Line::from(""));
-                lines.push(Line::from(w.clone()).fg(Color::Yellow));
+                lines.push(Line::from(Span::styled(
+                    w.clone(),
+                    Style::new().fg(th().caution),
+                )));
             }
             lines.push(Line::from(""));
             lines.push(Line::from(vec![
-                Span::styled(" y ", Style::new().reversed()),
-                Span::raw(" move to Trash    "),
-                Span::styled(" n ", Style::new().reversed()),
+                key_pill("y", th().caution),
+                Span::raw(" move to Trash     "),
+                key_pill("n", th().muted),
                 Span::raw(" cancel"),
             ]));
             (
-                " Move to Trash? ".to_string(),
+                "Move to Trash?".to_string(),
                 Text::from(lines),
-                Color::Yellow,
+                th().caution,
             )
         }
     };
@@ -453,14 +619,15 @@ fn draw_modal(f: &mut Frame, modal: &Modal) {
     let area = centered(f.area(), 90, text.height() as u16 + 3);
     f.render_widget(Clear, area);
     f.render_widget(
-        Paragraph::new(text)
-            .wrap(Wrap { trim: false })
-            .block(
-                Block::bordered()
-                    .title(title)
-                    .border_style(Style::new().fg(border)),
-            )
-            .style(Style::new().add_modifier(Modifier::empty())),
+        Paragraph::new(text).wrap(Wrap { trim: false }).block(
+            Block::bordered()
+                .border_type(BorderType::Rounded)
+                .border_style(Style::new().fg(border))
+                .title(Span::styled(
+                    format!(" {title} "),
+                    Style::new().fg(border).bold(),
+                )),
+        ),
         area,
     );
 }
@@ -468,7 +635,11 @@ fn draw_modal(f: &mut Frame, modal: &Modal) {
 pub fn draw_scanning(f: &mut Frame, root: &str, p: &ScanProgress, elapsed: Duration) {
     use std::sync::atomic::Ordering::Relaxed;
     let text = Text::from(vec![
-        Line::from(format!("Scanning {root} …")).bold(),
+        Line::from(vec![
+            Span::styled("diskwise", accent().bold()),
+            Span::raw("  scanning"),
+        ]),
+        Line::from(Span::styled(root.to_string(), Style::new().bold())),
         Line::from(""),
         Line::from(format!(
             "{} files · {} folders · {}",
@@ -476,15 +647,18 @@ pub fn draw_scanning(f: &mut Frame, root: &str, p: &ScanProgress, elapsed: Durat
             p.dirs.load(Relaxed),
             human_bytes(p.bytes.load(Relaxed))
         )),
-        Line::from(format!("{:.0}s", elapsed.as_secs_f64())).dim(),
-        Line::from(""),
-        Line::from("q to quit").dim(),
+        Line::from(Span::styled(
+            format!("{:.0}s · q to quit", elapsed.as_secs_f64()),
+            muted(),
+        )),
     ]);
-    let area = centered(f.area(), 60, 8);
+    let area = centered(f.area(), 60, 7);
     f.render_widget(
-        Paragraph::new(text)
-            .centered()
-            .block(Block::bordered().title(" diskwise ")),
+        Paragraph::new(text).centered().block(
+            Block::bordered()
+                .border_type(BorderType::Rounded)
+                .border_style(Style::new().fg(th().rule)),
+        ),
         area,
     );
 }
@@ -494,6 +668,33 @@ mod tests {
     use super::*;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+
+    /// Every cell as `[symbol, fg, bg, bold]`, for turning screens into images
+    /// when checking colours (see `render_real_snapshot`).
+    fn cells_json(app: &App, w: u16, h: u16) -> String {
+        let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+        t.draw(|f| draw(f, app)).unwrap();
+        let buf = t.backend().buffer();
+        let rows: Vec<String> = (0..h)
+            .map(|y| {
+                let cells: Vec<String> = (0..w)
+                    .map(|x| {
+                        let c = &buf[(x, y)];
+                        format!(
+                            "[{:?},\"{:?}\",\"{:?}\",{},{}]",
+                            c.symbol(),
+                            c.fg,
+                            c.bg,
+                            c.modifier.contains(ratatui::style::Modifier::BOLD),
+                            c.modifier.contains(ratatui::style::Modifier::REVERSED)
+                        )
+                    })
+                    .collect();
+                format!("[{}]", cells.join(","))
+            })
+            .collect();
+        format!("[{}]", rows.join(","))
+    }
 
     fn render(app: &App, w: u16, h: u16) -> String {
         let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
@@ -511,26 +712,39 @@ mod tests {
             .join("\n")
     }
 
-    /// Visual check against a real snapshot:
+    /// Visual check against a real snapshot (optionally DISKWISE_COLOR=16 etc., and
+    /// DISKWISE_RENDER_DIR to also write each screen's cells as JSON):
     /// DISKWISE_SNAPSHOT=snap.json cargo test -p diskwise-cli render_real -- --ignored --nocapture
     #[test]
     #[ignore]
     fn render_real_snapshot() {
+        if let Ok(c) = std::env::var("DISKWISE_COLOR") {
+            use clap::ValueEnum;
+            super::super::theme::init(super::super::theme::ColorMode::from_str(&c, true).unwrap());
+        }
         let path = std::env::var("DISKWISE_SNAPSHOT").expect("set DISKWISE_SNAPSHOT");
         let snap = crate::load_snapshot(std::path::Path::new(&path)).unwrap();
         let rules = crate::load_rules(snap.platform(), None).unwrap();
         let findings = diskwise_core::analyze(&snap, &rules, crate::now());
         let mut app = App::new(snap, findings);
         let home = std::env::var("HOME").unwrap();
-        app.reveal(&format!("{home}/Downloads"));
-        app.open();
-        println!("{}\n", render(&app, 120, 32));
+        let out = std::env::var("DISKWISE_RENDER_DIR").ok();
+        let show = |name: &str, app: &App| {
+            println!("{}\n", render(app, 120, 32));
+            if let Some(dir) = &out {
+                std::fs::write(format!("{dir}/{name}.json"), cells_json(app, 120, 32)).unwrap();
+            }
+        };
+        app.reveal(&format!(
+            "{home}/Library/Application Support/Google/GoogleUpdater"
+        ));
+        show("browse", &app);
         app.toggle_tab();
-        println!("{}\n", render(&app, 120, 32));
+        show("suggestions", &app);
         app.reveal(&format!("{home}/Library/Caches"));
         app.open();
         app.request_trash();
-        println!("{}", render(&app, 120, 32));
+        show("confirm", &app);
     }
 
     #[test]
@@ -546,7 +760,7 @@ mod tests {
         app.toggle_tab();
         let screen = render(&app, 100, 24);
         assert!(
-            screen.contains("Suggestions (3)") && screen.contains("safe"),
+            screen.contains("Suggestions · 3") && screen.contains("safe"),
             "{screen}"
         );
         app.request_trash();

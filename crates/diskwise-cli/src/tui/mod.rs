@@ -1,6 +1,7 @@
 //! `diskwise tui`: browse the disk and act on suggestions in the terminal.
 
 mod app;
+pub mod theme;
 mod ui;
 
 use std::path::{Path, PathBuf};
@@ -21,9 +22,11 @@ pub struct Options {
     /// Start from a saved snapshot instead of scanning.
     pub from: Option<PathBuf>,
     pub rules: Option<PathBuf>,
+    pub color: theme::ColorMode,
 }
 
 pub fn run(opts: Options) -> Result<()> {
+    theme::init(opts.color);
     let mut terminal = ratatui::init();
     let result = run_inner(&mut terminal, &opts);
     ratatui::restore();
@@ -129,6 +132,8 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => app.open(),
         KeyCode::Left | KeyCode::Char('h') | KeyCode::Backspace => app.up(),
         KeyCode::Tab | KeyCode::BackTab => app.toggle_tab(),
+        KeyCode::Char('1') => app.tab = app::Tab::Browse,
+        KeyCode::Char('2') => app.tab = app::Tab::Suggestions,
         KeyCode::Char('s') => app.cycle_sort(),
         KeyCode::Char('d') | KeyCode::Delete => app.request_trash(),
         KeyCode::Char('r') => app.rescan_requested = true,

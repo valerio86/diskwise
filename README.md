@@ -49,6 +49,12 @@ works locally or over SSH:
   Trash is emptied. On macOS it uses NSFileManager (no Finder permission prompt,
   works over SSH), so Finder's "Put Back" isn't offered; drag items back instead.
 - `s` sorts by size, name or oldest first; `r` rescans; `?` lists all keys.
+- **Colours** follow what the terminal supports: exact colours where
+  `COLORTERM=truecolor`, the 256-colour palette for `*-256color` terminals (and
+  macOS Terminal, iTerm, VS Code, …), the 16 standard colours for basic ones, and
+  none with `NO_COLOR` or `TERM=dumb` (inverse video and `█░` bars instead).
+  Override with `--color auto|truecolor|256|16|none`. The selected row and text
+  are readable on light and dark terminal themes alike.
 
 For a complete scan on macOS, give your terminal **Full Disk Access**
 (System Settings → Privacy & Security → Full Disk Access); on Linux, run as root
@@ -129,4 +135,5 @@ the same `id` as a built-in one replaces it.
   probe code compiled per OS.
 - `crates/diskwise-cli` — `diskwise` command-line tool and TUI (`src/tui/`:
   `app.rs` state and behaviour, unit-tested without a terminal; `ui.rs` drawing,
-  tested by rendering to a text buffer)
+  tested by rendering to a text buffer; `theme.rs` colour detection)
+- `dev/cells2png.py` — renders a TUI screen dump to PNG to check colours

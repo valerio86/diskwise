@@ -80,6 +80,9 @@ enum Command {
         /// Your own rules file (TOML); its rules take priority over the built-in ones.
         #[arg(long)]
         rules: Option<PathBuf>,
+        /// Colours: detected from the terminal by default (NO_COLOR is honoured).
+        #[arg(long, value_enum, default_value = "auto")]
+        color: tui::theme::ColorMode,
     },
     /// List the rules in effect.
     Rules {
@@ -162,11 +165,17 @@ fn main() -> Result<()> {
                 print_findings(&findings, items);
             }
         }
-        Command::Tui { path, from, rules } => {
+        Command::Tui {
+            path,
+            from,
+            rules,
+            color,
+        } => {
             tui::run(tui::Options {
                 root: path,
                 from,
                 rules,
+                color,
             })?;
         }
         Command::Rules { rules, os } => {
