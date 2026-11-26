@@ -31,6 +31,12 @@ pub fn snapshot(root: &Path, opts: ScanOptions, with_system: bool) -> std::io::R
         skipped_mounts,
     } = scan::scan(root, opts)?;
     let system = with_system.then(|| system::probe(&root.display().to_string()));
+    // Where the probe lists the real storage filesystems (Linux), in-memory ones
+    // like /dev and /run don't count as "not scanned".
+    let mut skipped_mounts = skipped_mounts;
+    if let Some(sys) = system.as_ref().filter(|s| !s.mounts.is_empty()) {
+        skipped_mounts.retain(|m| sys.mounts.iter().any(|mi| &mi.mount_point == m));
+    }
     Ok(Snapshot {
         version: model::SNAPSHOT_VERSION,
         os: platform::CURRENT.os.to_string(),

@@ -66,6 +66,17 @@ action = "admin"
 why = "Modules for every installed kernel version. Old kernels pile up when the package manager keeps them for fallback."
 how = "Debian/Ubuntu: sudo apt autoremove --purge. Fedora: set installonly_limit in /etc/dnf/dnf.conf. Keep the running kernel (uname -r) and one known-good one."
 
+[[rule]]
+id = "swap-file"
+title = "Swap file"
+match = ["/swapfile", "/swap.img"]
+min_size = "100M"
+category = "system"
+safety = "review"
+action = "info"
+why = "Disk space reserved as overflow memory. It is allocated in full whether or not it's being used."
+how = "Usually best left alone. To shrink it: sudo swapoff the file, recreate it smaller (fallocate + mkswap), then swapon. Check `free -h` first."
+
 # ── Services and logs ───────────────────────────────────────────────────────
 
 [[rule]]

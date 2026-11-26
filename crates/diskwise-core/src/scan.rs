@@ -2,8 +2,8 @@ use std::collections::HashSet;
 use std::fs::{self, Metadata};
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use rayon::prelude::*;
 
@@ -17,6 +17,8 @@ pub struct ScanOptions {
     pub min_node_size: u64,
     /// Don't descend into other mounted filesystems.
     pub one_filesystem: bool,
+    /// Live counters for a progress display (updated while scanning).
+    pub progress: Option<Arc<ScanProgress>>,
 }
 
 impl Default for ScanOptions {
@@ -24,8 +26,17 @@ impl Default for ScanOptions {
         ScanOptions {
             min_node_size: 10 * 1024 * 1024,
             one_filesystem: true,
+            progress: None,
         }
     }
+}
+
+/// Counters a UI can read from another thread while a scan runs.
+#[derive(Debug, Default)]
+pub struct ScanProgress {
+    pub files: AtomicU64,
+    pub dirs: AtomicU64,
+    pub bytes: AtomicU64,
 }
 
 struct Ctx {
@@ -161,6 +172,10 @@ fn scan_dir(path: &Path, name: String, meta: &Metadata, ctx: &Ctx) -> Node {
             0
         };
         file.files = 1;
+        if let Some(p) = &ctx.opts.progress {
+            p.files.fetch_add(1, Ordering::Relaxed);
+            p.bytes.fetch_add(file.allocated, Ordering::Relaxed);
+        }
         file.newest_mtime = child_meta.mtime();
         place(&mut node, &mut rest, file, min);
     }
@@ -171,6 +186,9 @@ fn scan_dir(path: &Path, name: String, meta: &Metadata, ctx: &Ctx) -> Node {
         .collect();
     for child in children {
         node.dirs += 1 + child.dirs;
+        if let Some(p) = &ctx.opts.progress {
+            p.dirs.fetch_add(1, Ordering::Relaxed);
+        }
         node.incomplete |= child.incomplete;
         place(&mut node, &mut rest, child, min);
     }
@@ -230,7 +248,7 @@ mod tests {
 
         let opts = ScanOptions {
             min_node_size: 1024 * 1024,
-            one_filesystem: true,
+            ..Default::default()
         };
         let ScanOutput { tree, errors, .. } = scan(&dir, opts).unwrap();
 

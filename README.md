@@ -10,7 +10,8 @@ safe ways to reclaim it.
 |---|---|---|
 | 1 | Scanner CLI + JSON snapshot + macOS probes (APFS volumes, snapshots, swap) | ✅ |
 | 2 | Rules engine + `suggest`: caches, regenerable data, app-managed data, your data, system space | ✅ |
-| 3 | Tauri UI: treemap, suggestions list, move-to-Trash actions with verification | ⏳ |
+| 3a | Terminal UI (`diskwise tui`): browse, suggestions, move to Trash with verification | ✅ |
+| 3b | Tauri desktop app: treemap, same core | ⏳ |
 | 4 | Optional local LLM to explain unrecognised folders | ⏳ |
 
 ## Usage
@@ -25,7 +26,29 @@ cargo build --release
 ./target/release/diskwise suggest -c                 # one line per suggestion
 ./target/release/diskwise suggest --from disk.snapshot.json --json
 ./target/release/diskwise rules                      # list rules in effect
+./target/release/diskwise tui                        # interactive browser
+./target/release/diskwise tui --from disk.snapshot.json
 ```
+
+## Terminal UI
+
+`diskwise tui` scans (with live progress) and opens an `ncdu`-style browser that
+works locally or over SSH:
+
+- **Browse**: folders by size with bars. Items a suggestion covers are tagged
+  and colour-coded (green safe, yellow caution, cyan review); folders show how
+  much is cleanable inside them. The details pane says what an item is and how
+  to clear it.
+- **Suggestions** (Tab): the `suggest` list; Enter jumps to the item in the
+  browser.
+- **Move to Trash** (`d`): always asks first, showing the exact paths, total,
+  and any caution. Never deletes outright. Items that should be cleared inside
+  their app, need an admin password, or only explain space get instructions
+  instead; top-level and home folders are refused. After moving, diskwise checks
+  each path is really gone before updating the tree. Space comes back when the
+  Trash is emptied. On macOS it uses NSFileManager (no Finder permission prompt,
+  works over SSH), so Finder's "Put Back" isn't offered; drag items back instead.
+- `s` sorts by size, name or oldest first; `r` rescans; `?` lists all keys.
 
 For a complete scan on macOS, give your terminal **Full Disk Access**
 (System Settings → Privacy & Security → Full Disk Access); on Linux, run as root
@@ -104,4 +127,6 @@ the same `id` as a built-in one replaces it.
   analysis (library; the Tauri app will reuse it). OS differences live in
   `src/platform/`: per-OS facts as plain data (testable anywhere) plus the
   probe code compiled per OS.
-- `crates/diskwise-cli` — `diskwise` command-line tool
+- `crates/diskwise-cli` — `diskwise` command-line tool and TUI (`src/tui/`:
+  `app.rs` state and behaviour, unit-tested without a terminal; `ui.rs` drawing,
+  tested by rendering to a text buffer)

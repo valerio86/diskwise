@@ -1,3 +1,5 @@
+mod tui;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -67,6 +69,18 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Browse the disk interactively and act on suggestions.
+    Tui {
+        /// Directory to scan.
+        #[arg(default_value = DEFAULT_ROOT)]
+        path: PathBuf,
+        /// Start from a saved snapshot instead of scanning.
+        #[arg(long)]
+        from: Option<PathBuf>,
+        /// Your own rules file (TOML); its rules take priority over the built-in ones.
+        #[arg(long)]
+        rules: Option<PathBuf>,
+    },
     /// List the rules in effect.
     Rules {
         /// Your own rules file (TOML), listed first.
@@ -106,6 +120,7 @@ fn main() -> Result<()> {
             let opts = ScanOptions {
                 min_node_size: min_size,
                 one_filesystem: !cross_mounts,
+                progress: None,
             };
             let snap = diskwise_core::snapshot(&path, opts, !no_system)
                 .with_context(|| format!("scanning {}", path.display()))?;
@@ -135,10 +150,7 @@ fn main() -> Result<()> {
                         .with_context(|| format!("scanning {}", path.display()))?
                 }
             };
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
+            let now = now();
             // Use the rules of the platform the snapshot came from.
             let ruleset = load_rules(snap.platform(), rules.as_deref())?;
             let findings = diskwise_core::analyze(&snap, &ruleset, now);
@@ -149,6 +161,13 @@ fn main() -> Result<()> {
             } else {
                 print_findings(&findings, items);
             }
+        }
+        Command::Tui { path, from, rules } => {
+            tui::run(tui::Options {
+                root: path,
+                from,
+                rules,
+            })?;
         }
         Command::Rules { rules, os } => {
             let p = match os.as_deref() {
@@ -166,6 +185,14 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Current time as Unix seconds.
+fn now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 fn load_snapshot(file: &Path) -> Result<Snapshot> {
