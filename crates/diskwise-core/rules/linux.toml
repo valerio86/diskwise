@@ -1,0 +1,159 @@
+# diskwise built-in rules: Linux only. Field reference: common.toml.
+
+# ── Package managers ────────────────────────────────────────────────────────
+
+[[rule]]
+id = "apt-cache"
+title = "Downloaded apt packages"
+match = ["/var/cache/apt/archives"]
+category = "cache"
+safety = "safe"
+action = "admin"
+why = "Copies of every .deb package apt has downloaded. Installed software doesn't need them."
+how = "sudo apt clean"
+
+[[rule]]
+id = "dnf-cache"
+title = "Downloaded dnf/yum packages and metadata"
+match = ["/var/cache/dnf", "/var/cache/yum"]
+category = "cache"
+safety = "safe"
+action = "admin"
+why = "Package downloads and repository metadata cached by dnf or yum."
+how = "sudo dnf clean all"
+
+[[rule]]
+id = "pacman-cache"
+title = "Downloaded pacman packages"
+match = ["/var/cache/pacman/pkg"]
+category = "cache"
+safety = "safe"
+action = "admin"
+why = "Every package version pacman has downloaded. Old ones are only useful for downgrading."
+how = "sudo paccache -rk2 (from pacman-contrib; keeps the two newest versions), or sudo pacman -Sc"
+
+[[rule]]
+id = "snap-revisions"
+title = "Snap packages and old revisions"
+match = ["/var/lib/snapd/snaps"]
+min_size = "500M"
+category = "app_managed"
+safety = "review"
+action = "in_app"
+why = "Snap keeps older revisions of each installed snap so it can roll back an update."
+how = "List them with `snap list --all` (old ones show as \"disabled\") and remove one with `sudo snap remove <name> --revision=<rev>`."
+prevent = "sudo snap set system refresh.retain=2"
+
+[[rule]]
+id = "flatpak"
+title = "Flatpak apps and runtimes"
+match = ["/var/lib/flatpak", "~/.local/share/flatpak"]
+min_size = "1G"
+category = "app_managed"
+safety = "review"
+action = "in_app"
+why = "Flatpak apps plus the shared runtimes they depend on. Runtimes stay installed after the last app that used them is removed."
+how = "flatpak uninstall --unused"
+
+[[rule]]
+id = "kernel-modules"
+title = "Installed kernels"
+match = ["/usr/lib/modules", "/lib/modules"]
+min_size = "1G"
+category = "system"
+safety = "review"
+action = "admin"
+why = "Modules for every installed kernel version. Old kernels pile up when the package manager keeps them for fallback."
+how = "Debian/Ubuntu: sudo apt autoremove --purge. Fedora: set installonly_limit in /etc/dnf/dnf.conf. Keep the running kernel (uname -r) and one known-good one."
+
+# ── Services and logs ───────────────────────────────────────────────────────
+
+[[rule]]
+id = "systemd-journal"
+title = "systemd journal"
+match = ["/var/log/journal"]
+min_size = "200M"
+category = "logs"
+safety = "caution"
+action = "admin"
+why = "System logs kept by journald. By default they may grow to 10% of the filesystem (capped at 4 GB)."
+how = "sudo journalctl --vacuum-size=200M (or --vacuum-time=30d)"
+prevent = "Set SystemMaxUse=200M in /etc/systemd/journald.conf, then sudo systemctl restart systemd-journald"
+
+[[rule]]
+id = "docker-data"
+title = "Docker images, containers and volumes"
+match = ["/var/lib/docker", "~/.local/share/docker"]
+category = "developer"
+safety = "caution"
+action = "in_app"
+why = "Everything Docker stores. Unused images and stopped containers often take most of it."
+how = "docker system prune -a (add --volumes to also drop unused volumes; check first, volumes may hold data). Don't delete files here by hand."
+
+[[rule]]
+id = "core-dumps"
+title = "Crash dumps"
+match = ["/var/lib/systemd/coredump", "/var/crash"]
+min_size = "10M"
+category = "logs"
+safety = "safe"
+action = "admin"
+why = "Memory dumps written when programs crash. Only useful for debugging those crashes."
+how = "Inspect with `coredumpctl list`, then delete the files with sudo."
+
+[[rule]]
+id = "large-temp"
+title = "Large temporary files"
+match = ["/var/tmp", "/tmp"]
+min_size = "1G"
+category = "system"
+safety = "review"
+action = "info"
+why = "Temporary files. /tmp is usually cleared on reboot; /var/tmp is kept across reboots."
+how = "Look for large leftovers from programs that are no longer running, and delete them. Don't remove files that running programs have open."
+
+[[rule]]
+id = "linux-logs"
+title = "System logs"
+fallback = true
+match = ["/var/log/*"]
+category = "logs"
+safety = "caution"
+action = "admin"
+why = "Logs written by system services. logrotate manages most of them."
+how = "Rotated copies (*.1, *.gz) can be deleted with sudo. If one log keeps growing, check its logrotate settings."
+
+# ── Per-user ────────────────────────────────────────────────────────────────
+
+[[rule]]
+id = "vscode-server"
+title = "VS Code remote server"
+match = ["~/.vscode-server", "~/.cursor-server"]
+min_size = "500M"
+category = "developer"
+safety = "caution"
+action = "trash"
+why = "The server VS Code (or Cursor) installs over SSH, with its extensions. Old versions pile up after updates."
+how = "Disconnect remote sessions, then delete the folder. It's reinstalled on the next connection."
+
+[[rule]]
+id = "linux-trash"
+title = "Trash"
+match = ["~/.local/share/Trash"]
+min_size = "10M"
+category = "user_data"
+safety = "safe"
+action = "in_app"
+why = "Files you already deleted. They still take up space until the trash is emptied."
+how = "Empty the trash in your file manager, or delete the contents of ~/.local/share/Trash/files and ~/.local/share/Trash/info."
+
+[[rule]]
+id = "linux-user-cache"
+title = "App caches"
+fallback = true
+match = ["~/.cache/*"]
+category = "cache"
+safety = "safe"
+action = "trash"
+why = "The per-user cache folder (XDG). Apps rebuild what they need."
+how = "Close the app, then delete the folder."

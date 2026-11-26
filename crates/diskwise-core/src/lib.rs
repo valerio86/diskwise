@@ -1,6 +1,8 @@
-//! diskwise core: scan a disk into a size tree and collect macOS storage facts.
+//! diskwise core: scan a disk into a size tree, collect storage facts the walk
+//! can't see, and turn both into cleanup suggestions. Supports macOS and Linux.
 
 pub mod model;
+pub mod platform;
 pub mod provenance;
 pub mod rules;
 pub mod scan;
@@ -11,22 +13,27 @@ use std::path::Path;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 pub use model::{Node, NodeKind, Snapshot};
+pub use platform::Platform;
 pub use rules::RuleSet;
 pub use scan::ScanOptions;
 pub use suggest::{Finding, analyze};
 
-/// The APFS Data volume. Scanning it (rather than `/`) covers all user data once,
-/// without walking the read-only System volume or double-counting firmlinks.
-pub const DEFAULT_ROOT: &str = "/System/Volumes/Data";
+/// What a scan walks by default on this platform.
+pub const DEFAULT_ROOT: &str = platform::CURRENT.default_root;
 
 /// Run a full scan and, optionally, the system probes.
 pub fn snapshot(root: &Path, opts: ScanOptions, with_system: bool) -> std::io::Result<Snapshot> {
     let started = Instant::now();
     let min_node_size = opts.min_node_size;
-    let (tree, errors) = scan::scan(root, opts)?;
+    let scan::ScanOutput {
+        tree,
+        errors,
+        skipped_mounts,
+    } = scan::scan(root, opts)?;
     let system = with_system.then(|| system::probe(&root.display().to_string()));
     Ok(Snapshot {
         version: model::SNAPSHOT_VERSION,
+        os: platform::CURRENT.os.to_string(),
         root: root.display().to_string(),
         scanned_at: SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -36,6 +43,7 @@ pub fn snapshot(root: &Path, opts: ScanOptions, with_system: bool) -> std::io::R
         min_node_size,
         tree,
         errors,
+        skipped_mounts,
         system,
     })
 }

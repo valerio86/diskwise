@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Version of the JSON snapshot format. Bump when the shape changes.
-pub const SNAPSHOT_VERSION: u32 = 1;
+pub const SNAPSHOT_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -61,12 +61,26 @@ pub struct ErrorSummary {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Snapshot {
     pub version: u32,
+    /// Platform the scan ran on ("macos", "linux"); empty in v1 snapshots (macOS).
+    #[serde(default)]
+    pub os: String,
     pub root: String,
     pub scanned_at: i64,
     pub duration_ms: u64,
     pub min_node_size: u64,
     pub tree: Node,
     pub errors: ErrorSummary,
+    /// Mount points of other filesystems inside the root that were not scanned.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skipped_mounts: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system: Option<crate::system::SystemInfo>,
+}
+
+impl Snapshot {
+    /// The platform this snapshot was taken on (falls back to this machine's for
+    /// an unknown name).
+    pub fn platform(&self) -> &'static crate::Platform {
+        crate::Platform::by_name(&self.os).unwrap_or(crate::platform::CURRENT)
+    }
 }

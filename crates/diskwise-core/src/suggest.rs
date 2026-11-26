@@ -5,10 +5,11 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+use crate::human_bytes;
 use crate::model::{Node, NodeKind, Snapshot};
+use crate::platform;
 use crate::provenance::download_hosts;
 use crate::rules::{Action, Category, RuleSet, Safety};
-use crate::{DEFAULT_ROOT, human_bytes};
 
 const GB: u64 = 1_000_000_000;
 /// Preboot above this is worth explaining.
@@ -16,6 +17,62 @@ const PREBOOT_NOTE_THRESHOLD: u64 = 10 * GB;
 /// Unscanned Data-volume space above this is worth explaining.
 const GAP_NOTE_THRESHOLD: u64 = 5 * GB;
 const SWAP_NOTE_THRESHOLD: u64 = 4 * GB;
+/// Filesystems at least this full get a finding of their own.
+const NEARLY_FULL: f64 = 0.9;
+
+/// Other filesystems mounted inside the scan root weren't scanned: say so, and how
+/// much they hold when the mount list knows (Linux).
+fn skipped_mounts_finding(snap: &Snapshot) -> Option<Finding> {
+    if snap.skipped_mounts.is_empty() {
+        return None;
+    }
+    let p = snap.platform();
+    let paths: Vec<String> = snap
+        .skipped_mounts
+        .iter()
+        .map(|m| p.display_path(m))
+        .collect();
+    let mounts = snap
+        .system
+        .as_ref()
+        .map(|s| s.mounts.as_slice())
+        .unwrap_or_default();
+    let used: Vec<Option<u64>> = paths
+        .iter()
+        .map(|path| {
+            mounts
+                .iter()
+                .find(|m| &m.mount_point == path)
+                .map(|m| m.capacity.saturating_sub(m.free))
+        })
+        .collect();
+    let size_known = used.iter().all(Option::is_some);
+    let mut f = info(
+        "skipped-mounts",
+        "Other filesystems not scanned",
+        used.iter().flatten().sum(),
+        size_known,
+        format!(
+            "{} separate filesystem(s) are mounted inside {} and were not scanned: {}.",
+            paths.len(),
+            p.display_path(&snap.root),
+            paths.join(", ")
+        ),
+        "Scan each one directly (e.g. `diskwise suggest /home`), or rescan with --cross-mounts.",
+    );
+    f.items = paths
+        .into_iter()
+        .zip(used)
+        .map(|(path, bytes)| Item {
+            path,
+            bytes: bytes.unwrap_or(0),
+            newest_mtime: 0,
+            is_dir: true,
+            source: None,
+        })
+        .collect();
+    Some(f)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Item {
@@ -54,16 +111,16 @@ impl Finding {
     }
 }
 
-/// Analyse a snapshot. `now` is Unix seconds (passed in for testability).
+/// Analyse a snapshot. `rules` should be built for the snapshot's platform
+/// (`RuleSet::builtin_for(snap.platform())`). `now` is Unix seconds.
+///
+/// Conditions that look at the filesystem (`sibling`, `from`) are evaluated on
+/// this machine, so for a snapshot taken elsewhere they simply don't match: the
+/// affected items fall through to more cautious rules.
 pub fn analyze(snap: &Snapshot, rules: &RuleSet, now: i64) -> Vec<Finding> {
     let mut by_rule: HashMap<usize, Finding> = HashMap::new();
-    walk(
-        &snap.tree,
-        &display_root(&snap.root),
-        rules,
-        now,
-        &mut by_rule,
-    );
+    let root = snap.platform().display_path(&snap.root);
+    walk(&snap.tree, &root, rules, now, &mut by_rule);
 
     let mut findings: Vec<Finding> = by_rule.into_values().collect();
     for f in &mut findings {
@@ -74,16 +131,6 @@ pub fn analyze(snap: &Snapshot, rules: &RuleSet, now: i64) -> Vec<Finding> {
         (a.safety, std::cmp::Reverse(a.bytes)).cmp(&(b.safety, std::cmp::Reverse(b.bytes)))
     });
     findings
-}
-
-/// The Data volume is mounted at /System/Volumes/Data but its folders appear at `/`
-/// through firmlinks; show (and act on) the familiar paths.
-fn display_root(root: &str) -> String {
-    match root.strip_prefix(DEFAULT_ROOT) {
-        Some("") => "/".to_string(),
-        Some(rest) if rest.starts_with('/') => rest.to_string(),
-        _ => root.to_string(),
-    }
 }
 
 fn join(dir: &str, name: &str) -> String {
@@ -153,7 +200,34 @@ fn info(id: &str, title: &str, bytes: u64, size_known: bool, why: String, how: &
 
 fn system_findings(snap: &Snapshot) -> Vec<Finding> {
     let mut out = Vec::new();
+    if let Some(f) = skipped_mounts_finding(snap) {
+        out.push(f);
+    }
     let Some(sys) = &snap.system else { return out };
+
+    for m in &sys.mounts {
+        let used = m.capacity.saturating_sub(m.free);
+        if m.capacity > 0 && used as f64 / m.capacity as f64 >= NEARLY_FULL {
+            out.push(info(
+                &format!("nearly-full:{}", m.mount_point),
+                &format!("{} is nearly full", m.mount_point),
+                used,
+                true,
+                format!(
+                    "{} ({}) has {} free of {} ({:.0}% used).",
+                    m.mount_point,
+                    m.fs_type,
+                    human_bytes(m.free),
+                    human_bytes(m.capacity),
+                    used as f64 / m.capacity as f64 * 100.0
+                ),
+                &format!(
+                    "Scan it to see what's using the space: diskwise suggest {}",
+                    m.mount_point
+                ),
+            ));
+        }
+    }
 
     if let Some(c) = &sys.container {
         let volume = |role: &str| c.volumes.iter().find(|v| v.roles.iter().any(|r| r == role));
@@ -176,7 +250,7 @@ fn system_findings(snap: &Snapshot) -> Vec<Finding> {
         }
 
         if let Some(data) = volume("Data")
-            && snap.root == DEFAULT_ROOT
+            && snap.root == platform::MACOS.default_root
         {
             let gap = data.used.saturating_sub(snap.tree.allocated);
             if gap > GAP_NOTE_THRESHOLD {
@@ -287,12 +361,14 @@ mod tests {
     fn snapshot(tree: Node, data_used: u64) -> Snapshot {
         Snapshot {
             version: SNAPSHOT_VERSION,
-            root: DEFAULT_ROOT.into(),
+            os: "macos".into(),
+            root: platform::MACOS.default_root.into(),
             scanned_at: NOW,
             duration_ms: 0,
             min_node_size: 0,
             tree,
             errors: ErrorSummary::default(),
+            skipped_mounts: vec![],
             system: Some(SystemInfo {
                 container: Some(ContainerInfo {
                     reference: "disk3".into(),
@@ -316,14 +392,55 @@ mod tests {
                 snapshots: vec!["com.apple.os.update-ABC".into()],
                 swap: None,
                 warnings: vec![],
+                ..Default::default()
             }),
         }
     }
 
     #[test]
+    fn linux_snapshot_reports_skipped_and_full_mounts() {
+        use crate::system::MountInfo;
+        let mut snap = snapshot(dir("/", vec![]), 0);
+        snap.os = "linux".into();
+        snap.root = "/".into();
+        snap.skipped_mounts = vec!["/home".into(), "/boot".into()];
+        let sys = snap.system.as_mut().unwrap();
+        sys.container = None;
+        sys.snapshots.clear();
+        sys.mounts = vec![
+            MountInfo {
+                mount_point: "/home".into(),
+                device: "/dev/sdb1".into(),
+                fs_type: "ext4".into(),
+                capacity: 100 * GB,
+                free: 5 * GB,
+            },
+            MountInfo {
+                mount_point: "/boot".into(),
+                device: "/dev/sda1".into(),
+                fs_type: "ext4".into(),
+                capacity: GB,
+                free: GB / 2,
+            },
+        ];
+        let findings = analyze(&snap, &RuleSet::builtin_for(&platform::LINUX).unwrap(), NOW);
+        let skipped = findings.iter().find(|f| f.id == "skipped-mounts").unwrap();
+        assert!(skipped.size_known);
+        assert_eq!(skipped.bytes, 95 * GB + GB / 2);
+        assert!(findings.iter().any(|f| f.id == "nearly-full:/home"));
+        assert!(!findings.iter().any(|f| f.id == "nearly-full:/boot"));
+        // No macOS-only findings on Linux.
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.id == "preboot-large" || f.id == "unscanned-space")
+        );
+    }
+
+    #[test]
     fn rules_and_system_checks() {
         let tree = dir(
-            DEFAULT_ROOT,
+            platform::MACOS.default_root,
             vec![
                 dir(".adobeTemp", vec![file("a.pimx", 3 * GB, 400)]),
                 dir(
@@ -348,7 +465,7 @@ mod tests {
             ],
         );
         let snap = snapshot(tree, 20 * GB);
-        let findings = analyze(&snap, &RuleSet::builtin().unwrap(), NOW);
+        let findings = analyze(&snap, &RuleSet::builtin_for(&platform::MACOS).unwrap(), NOW);
         let get = |id: &str| findings.iter().find(|f| f.id == id);
 
         let caches = get("user-caches").expect("caches");
@@ -368,16 +485,5 @@ mod tests {
 
         // Safe findings come first.
         assert_eq!(findings[0].safety, Safety::Safe);
-    }
-
-    #[test]
-    fn display_root_maps_data_volume() {
-        assert_eq!(display_root(DEFAULT_ROOT), "/");
-        assert_eq!(display_root("/System/Volumes/Data/Users/v"), "/Users/v");
-        assert_eq!(display_root("/Users/v"), "/Users/v");
-        assert_eq!(
-            display_root("/System/Volumes/DataX"),
-            "/System/Volumes/DataX"
-        );
     }
 }

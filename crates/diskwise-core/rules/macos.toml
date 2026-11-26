@@ -1,30 +1,6 @@
-# diskwise built-in rules.
-#
-# Each rule claims tree nodes whose absolute path matches one of its `match` globs
-# (and none of its `exclude` globs) and that pass its conditions. Rules are tried
-# in file order and the FIRST match wins, so specific rules must come before
-# generic ones. A claimed node's children are not examined further.
-#
-# Globs: `*` stays within one path segment, `**` spans segments, `{a,b}` alternates.
-# `~/` means every home folder (/Users/*/).
-#
-# Fields:
-#   kind             "dir" | "file" | "any" (default any)
-#   min_size         smallest node to report, e.g. "50M" (default 50M)
-#   older_than_days  only if nothing inside changed for this long
-#   sibling          only if this file exists next to the match (e.g. Cargo.toml)
-#   category         cache | logs | regenerable | app_managed | installer | developer | user_data | system
-#   safety           safe     – deleting loses nothing; it regrows or is never needed again
-#                    caution  – safe once you've done something first (quit the app, check a project)
-#                    review   – your data or a judgment call; look before acting
-#   action           trash    – move to Trash
-#                    in_app   – clear it from inside the owning app
-#                    admin    – needs your admin password (owned by root)
-#                    archive  – move to external or cloud storage
-#                    info     – nothing to delete; explains where space went
-#   why / how / prevent   shown to the user
+# diskwise built-in rules: macOS only. Field reference: common.toml.
 
-# ── App-specific (most specific first) ──────────────────────────────────────
+# ── Apps ────────────────────────────────────────────────────────────────────
 
 [[rule]]
 id = "claude-vm-bundle"
@@ -225,73 +201,7 @@ action = "in_app"
 why = "Simulator devices and OS runtimes for Xcode."
 how = "Run `xcrun simctl delete unavailable`. To remove a runtime: `xcrun simctl runtime list`, then `xcrun simctl runtime delete <id>`."
 
-[[rule]]
-id = "rust-target"
-title = "Rust build output"
-match = ["~/**/target"]
-kind = "dir"
-sibling = "Cargo.toml"
-older_than_days = 30
-category = "developer"
-safety = "safe"
-action = "trash"
-why = "Compiled artifacts for a Rust project you haven't built in a month. `cargo build` regenerates them."
-how = "Run `cargo clean` in the project, or move target/ to the Trash."
-
-[[rule]]
-id = "node-modules"
-title = "Node.js dependencies"
-match = ["~/**/node_modules"]
-kind = "dir"
-category = "developer"
-safety = "caution"
-action = "trash"
-why = "Installed npm packages. `npm install` restores them from package.json."
-how = "For projects you aren't working on, move node_modules/ to the Trash."
-
-[[rule]]
-id = "python-venv"
-title = "Python virtual environments"
-match = ["~/**/.venv", "~/**/venv"]
-kind = "dir"
-category = "developer"
-safety = "caution"
-action = "trash"
-why = "Installed Python packages for one project. They can be recreated from requirements.txt or pyproject.toml."
-how = "For dormant projects, delete the folder, then recreate it later with `python -m venv .venv && pip install -r requirements.txt` (or `uv sync`)."
-
-[[rule]]
-id = "package-manager-caches"
-title = "Package manager caches"
-match = ["~/.npm/_cacache", "~/.gradle/caches", "~/.cargo/registry", "~/.cache/pip", "~/.cache/uv", "~/.pnpm-store", "~/Library/pnpm/store"]
-category = "cache"
-safety = "safe"
-action = "trash"
-why = "Downloaded packages kept so reinstalls are faster. They're downloaded again when needed."
-how = "Use the tool's own cleaner (`npm cache clean --force`, `uv cache clean`, `cargo cache -a` if installed), or move the folder to the Trash."
-
-[[rule]]
-id = "maven-repo"
-title = "Maven local repository"
-match = ["~/.m2/repository"]
-min_size = "200M"
-category = "cache"
-safety = "safe"
-action = "trash"
-why = "Downloaded Java dependencies. Maven and Gradle download them again on the next build."
-how = "Move to the Trash. Your next build will be slower while dependencies download."
-
-[[rule]]
-id = "ml-models"
-title = "Downloaded AI models"
-match = ["~/.cache/huggingface", "~/.ollama/models", "~/.cache/lm-studio", "~/.lmstudio/models"]
-category = "developer"
-safety = "review"
-action = "in_app"
-why = "Local machine-learning model weights. They can be downloaded again, but often run to several GB each."
-how = "Remove models you no longer use with the tool's own command (`ollama rm <model>`, `huggingface-cli delete-cache`)."
-
-# ── Generic caches and logs ────────────────────────────────────────────────
+# ── Caches, logs, system ────────────────────────────────────────────────────
 
 [[rule]]
 id = "electron-app-caches"
@@ -310,6 +220,7 @@ how = "Quit the app first, then move the folder to the Trash. The app rebuilds i
 
 [[rule]]
 id = "user-caches"
+fallback = true
 title = "App caches"
 match = ["~/Library/Caches/*"]
 category = "cache"
@@ -320,6 +231,7 @@ how = "Quit the app, then move the folder's contents to the Trash. Some space wi
 
 [[rule]]
 id = "user-logs"
+fallback = true
 title = "App logs"
 match = ["~/Library/Logs/*"]
 category = "logs"
@@ -330,6 +242,7 @@ how = "Move them to the Trash."
 
 [[rule]]
 id = "system-caches"
+fallback = true
 title = "System-wide caches"
 match = ["/Library/Caches/*"]
 category = "cache"
@@ -340,6 +253,7 @@ how = "Use Finder with an admin password, or `sudo rm -rf` on specific subfolder
 
 [[rule]]
 id = "system-logs"
+fallback = true
 title = "System-wide logs"
 match = ["/Library/Logs/*", "/private/var/log"]
 category = "logs"
@@ -389,118 +303,3 @@ safety = "review"
 action = "info"
 why = "Compilers and git used by Homebrew and most development tools."
 how = "Keep these if you use git, Homebrew, or build software."
-
-# ── Your files (generic; keep these last) ──────────────────────────────────
-
-# Installers are split by where macOS recorded them as downloaded from
-# (com.apple.metadata:kMDItemWhereFroms). Store purchases come first: if the store
-# or developer disappears, the installer can't be downloaded again.
-
-[[rule]]
-id = "installer-purchased"
-title = "Purchased installers in Downloads"
-match = ["~/Downloads/**/*.{dmg,pkg,mpkg,iso,xip,zip}"]
-kind = "file"
-min_size = "20M"
-from = [
-  "humble.com", "humblebundle.com", "gog.com", "gogalaxy.com", "gog-statics.com",
-  "itch.io", "itch.zone", "gumroad.com", "bandcamp.com", "fastspring.com",
-  "paddle.com", "paddle.net", "lemonsqueezy.com", "sellfy.com", "payhip.com",
-  "sendowl.com", "kagi.com", "devmate.com", "bundlehunt.com", "stacksocial.com",
-]
-category = "installer"
-safety = "review"
-action = "archive"
-why = "Downloaded from a store you buy software from. If the store, the developer, or your account goes away, you may not be able to download it again."
-how = "Keep a copy on backup or cloud storage, then delete it here. Keep the store's receipt or license key with it."
-
-[[rule]]
-id = "installer-vendor"
-title = "Installers from major vendors"
-match = ["~/Downloads/**/*.{dmg,pkg,mpkg,iso,xip}"]
-kind = "file"
-min_size = "20M"
-older_than_days = 14
-from = [
-  "apple.com", "google.com", "mozilla.org", "mozilla.net", "microsoft.com", "office.com",
-  "adobe.com", "zoom.us", "slack.com", "slack-edge.com", "dropbox.com", "docker.com",
-  "epicgames.com", "unrealengine.com", "steampowered.com", "spotify.com",
-  "whatsapp.com", "whatsapp.net", "1password.com", "agilebits.com", "brave.com",
-  "signal.org", "telegram.org", "discord.com", "discordapp.net", "notion.so",
-  "figma.com", "jetbrains.com", "visualstudio.com", "python.org", "nodejs.org",
-  "videolan.org", "blender.org", "libreoffice.org", "gimp.org", "ubuntu.com",
-  "debian.org", "raspberrypi.com", "anthropic.com", "claude.ai", "openai.com",
-  "epson.com", "canon.com", "hp.com", "brother.com", "logitech.com", "garmin.com",
-  "nvidia.com", "github.com", "githubusercontent.com", "sourceforge.net", "fosshub.com",
-]
-category = "installer"
-safety = "safe"
-action = "trash"
-why = "An installer from a large vendor that keeps its downloads available. You can get the current version again from their site."
-how = "Move to the Trash. If you rely on this exact version (e.g. a driver for old hardware), keep a copy instead."
-
-[[rule]]
-id = "installer-unknown-source"
-title = "Installers of unknown origin"
-match = ["~/Downloads/**/*.{dmg,pkg,mpkg,iso,xip}"]
-kind = "file"
-min_size = "20M"
-older_than_days = 14
-category = "installer"
-safety = "caution"
-action = "trash"
-why = "An installer from a site diskwise doesn't recognise, or with no recorded source. It may be free and easy to download again, or a paid app from a small developer that might not be around later."
-how = "Free app from a well-known site: move to the Trash. Paid app or small developer: back it up first."
-
-[[rule]]
-id = "downloaded-archives"
-title = "Archives in Downloads"
-match = ["~/Downloads/**/*.{zip,tar,gz,tgz,bz2,xz,7z,rar}"]
-kind = "file"
-min_size = "20M"
-older_than_days = 30
-category = "user_data"
-safety = "review"
-action = "trash"
-why = "Compressed files. These can hold anything, from a throwaway download to the only copy of something, so check what's inside."
-how = "If you've already extracted it and kept the contents, the archive can go to the Trash. Otherwise extract it or move it somewhere permanent."
-
-[[rule]]
-id = "old-downloads"
-title = "Old downloads"
-match = ["~/Downloads/*"]
-min_size = "20M"
-older_than_days = 365
-category = "user_data"
-safety = "review"
-action = "trash"
-why = "Items in Downloads that haven't changed in over a year."
-how = "Look through them: keep what matters (move it out of Downloads) and trash the rest."
-
-[[rule]]
-id = "large-old-files"
-title = "Large files untouched for a year"
-match = ["~/**"]
-exclude = ["~/Library/**", "~/.*/**", "~/.*"]
-kind = "file"
-min_size = "1G"
-older_than_days = 365
-category = "user_data"
-safety = "review"
-action = "archive"
-why = "Big files you haven't modified in over a year: videos, disk images, exports."
-how = "Archive them to an external drive or cloud storage if you want to keep them."
-
-[[rule]]
-id = "dormant-folders"
-title = "Large folders untouched for two years"
-match = ["~/*/*"]
-exclude = ["~/Library/**", "~/.*/**", "~/.*"]
-kind = "dir"
-min_size = "1G"
-older_than_days = 730
-category = "user_data"
-safety = "review"
-action = "archive"
-why = "Big folders where nothing has changed in two years, such as old photo years or finished projects."
-how = "Archive them to an external drive or cloud storage, check the copy opens, then remove them here."

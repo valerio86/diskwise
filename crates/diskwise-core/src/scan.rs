@@ -35,6 +35,15 @@ struct Ctx {
     seen_links: Mutex<HashSet<(u64, u64)>>,
     error_count: AtomicU64,
     error_samples: Mutex<Vec<String>>,
+    skipped_mounts: Mutex<Vec<String>>,
+}
+
+/// What one scan found.
+pub struct ScanOutput {
+    pub tree: Node,
+    pub errors: ErrorSummary,
+    /// Mount points of other filesystems that were not entered.
+    pub skipped_mounts: Vec<String>,
 }
 
 impl Ctx {
@@ -62,8 +71,8 @@ impl Ctx {
     }
 }
 
-/// Scan `root` and return its size tree plus a summary of unreadable paths.
-pub fn scan(root: &Path, opts: ScanOptions) -> std::io::Result<(Node, ErrorSummary)> {
+/// Scan `root` into a size tree, noting unreadable paths and skipped mount points.
+pub fn scan(root: &Path, opts: ScanOptions) -> std::io::Result<ScanOutput> {
     let meta = fs::symlink_metadata(root)?;
     let ctx = Ctx {
         opts,
@@ -71,13 +80,20 @@ pub fn scan(root: &Path, opts: ScanOptions) -> std::io::Result<(Node, ErrorSumma
         seen_links: Mutex::new(HashSet::new()),
         error_count: AtomicU64::new(0),
         error_samples: Mutex::new(Vec::new()),
+        skipped_mounts: Mutex::new(Vec::new()),
     };
     let tree = scan_dir(root, root.display().to_string(), &meta, &ctx);
     let errors = ErrorSummary {
         count: ctx.error_count.load(Ordering::Relaxed),
         samples: ctx.error_samples.into_inner().unwrap(),
     };
-    Ok((tree, errors))
+    let mut skipped_mounts = ctx.skipped_mounts.into_inner().unwrap();
+    skipped_mounts.sort();
+    Ok(ScanOutput {
+        tree,
+        errors,
+        skipped_mounts,
+    })
 }
 
 fn scan_dir(path: &Path, name: String, meta: &Metadata, ctx: &Ctx) -> Node {
@@ -120,7 +136,17 @@ fn scan_dir(path: &Path, name: String, meta: &Metadata, ctx: &Ctx) -> Node {
 
         if child_meta.is_dir() {
             if ctx.opts.one_filesystem && child_meta.dev() != ctx.root_dev {
-                continue; // mount point of another volume
+                // Mount point of another filesystem: note it rather than skip
+                // silently, unless it holds no storage (automount placeholders such
+                // as macOS's /home, or virtual filesystems like /proc).
+                let holds_data = crate::system::fs_usage(&child_path).is_ok_and(|u| u.capacity > 0);
+                if holds_data {
+                    ctx.skipped_mounts
+                        .lock()
+                        .unwrap()
+                        .push(child_path.display().to_string());
+                }
+                continue;
             }
             subdirs.push((child_path, child_name, child_meta));
             continue;
@@ -206,7 +232,7 @@ mod tests {
             min_node_size: 1024 * 1024,
             one_filesystem: true,
         };
-        let (tree, errors) = scan(&dir, opts).unwrap();
+        let ScanOutput { tree, errors, .. } = scan(&dir, opts).unwrap();
 
         assert_eq!(errors.count, 0);
         assert_eq!(tree.files, 2);
@@ -229,7 +255,7 @@ mod tests {
         write(&dir.join("one"), 1024 * 1024);
         fs::hard_link(dir.join("one"), dir.join("two")).unwrap();
 
-        let (tree, _) = scan(&dir, ScanOptions::default()).unwrap();
+        let tree = scan(&dir, ScanOptions::default()).unwrap().tree;
         let file_alloc: u64 = fs::symlink_metadata(dir.join("one")).unwrap().blocks() * 512;
         let dir_alloc: u64 = fs::symlink_metadata(&dir).unwrap().blocks() * 512;
         assert_eq!(tree.allocated, file_alloc + dir_alloc);

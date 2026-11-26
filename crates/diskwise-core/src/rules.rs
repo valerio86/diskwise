@@ -9,10 +9,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::model::{Node, NodeKind};
 use crate::parse_size;
+use crate::platform::{self, Platform};
 use crate::provenance::{download_hosts, host_matches};
-
-/// Rules shipped with diskwise.
-pub const BUILTIN_RULES: &str = include_str!("../rules/default.toml");
 
 const DEFAULT_MIN_SIZE: u64 = 50 << 20;
 const DAY: i64 = 86_400;
@@ -63,7 +61,8 @@ pub enum KindFilter {
 
 impl fmt::Display for Category {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
+        // `pad` (not `write_str`) so width/alignment flags like `{:<8}` work.
+        f.pad(match self {
             Category::Cache => "cache",
             Category::Logs => "logs",
             Category::Regenerable => "regenerable",
@@ -78,7 +77,8 @@ impl fmt::Display for Category {
 
 impl fmt::Display for Safety {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
+        // `pad` (not `write_str`) so width/alignment flags like `{:<8}` work.
+        f.pad(match self {
             Safety::Safe => "safe",
             Safety::Caution => "caution",
             Safety::Review => "review",
@@ -88,7 +88,8 @@ impl fmt::Display for Safety {
 
 impl fmt::Display for Action {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
+        // `pad` (not `write_str`) so width/alignment flags like `{:<8}` work.
+        f.pad(match self {
             Action::Trash => "move to Trash",
             Action::InApp => "clear in the app",
             Action::Admin => "needs admin password",
@@ -113,9 +114,12 @@ pub struct RuleDef {
     pub min_size: Option<String>,
     pub older_than_days: Option<u32>,
     pub sibling: Option<String>,
-    /// Only files macOS recorded as downloaded from one of these domains (or subdomains).
+    /// Only files the OS recorded as downloaded from one of these domains (or subdomains).
     #[serde(default)]
     pub from: Vec<String>,
+    /// A generic catch-all, tried only after every specific rule.
+    #[serde(default)]
+    pub fallback: bool,
     pub category: Category,
     pub safety: Safety,
     pub action: Action,
@@ -148,29 +152,44 @@ pub struct RuleSet {
 }
 
 impl RuleSet {
-    /// The built-in rules only.
+    /// The built-in rules for this machine's platform.
     pub fn builtin() -> Result<Self> {
-        Self::from_sources(&[("built-in rules", BUILTIN_RULES)])
+        Self::builtin_for(platform::CURRENT)
+    }
+
+    /// The built-in rules for `platform` (e.g. to analyse a snapshot from another OS).
+    pub fn builtin_for(platform: &Platform) -> Result<Self> {
+        Self::from_sources(platform, &platform.builtin_rule_sources())
+    }
+
+    /// The user's rules file followed by the built-in rules for `platform`.
+    pub fn with_user_rules(platform: &Platform, name: &str, text: &str) -> Result<Self> {
+        let [os, common] = platform.builtin_rule_sources();
+        Self::from_sources(platform, &[(name, text), os, common])
     }
 
     /// Compile rules from TOML sources. Earlier sources take priority, so put user
-    /// rules before the built-in ones.
-    pub fn from_sources(sources: &[(&str, &str)]) -> Result<Self> {
+    /// rules before the built-in ones. Fallback rules from every source are moved
+    /// after all specific ones. `~/` expands to the platform's home folders.
+    pub fn from_sources(platform: &Platform, sources: &[(&str, &str)]) -> Result<Self> {
         let mut defs = Vec::new();
+        let mut ids = std::collections::HashSet::new();
         for (name, text) in sources {
             let file: RuleFile = toml::from_str(text).with_context(|| format!("parsing {name}"))?;
-            defs.extend(file.rules);
+            // A user rule with a built-in's id replaces it: the earlier one wins.
+            defs.extend(file.rules.into_iter().filter(|d| ids.insert(d.id.clone())));
         }
+        defs.sort_by_key(|d| d.fallback); // stable: keeps order within each tier
 
+        let glob = |p: &str| -> Result<Glob> {
+            Ok(GlobBuilder::new(&expand_home(p, platform.home_base))
+                .literal_separator(true)
+                .build()?)
+        };
         let mut include = GlobSetBuilder::new();
         let mut owner = Vec::new();
         let mut rules = Vec::with_capacity(defs.len());
-        let mut ids = std::collections::HashSet::new();
         for def in defs {
-            if !ids.insert(def.id.clone()) {
-                // A user rule with a built-in's id replaces it: the earlier one wins.
-                continue;
-            }
             let idx = rules.len();
             for p in &def.patterns {
                 include.add(glob(p).with_context(|| format!("rule {}: pattern {p:?}", def.id))?);
@@ -248,26 +267,21 @@ impl Rule {
     }
 }
 
-/// `~/x` means `x` in every home folder.
-fn expand_home(pattern: &str) -> String {
+/// `~/x` means `x` in every home folder under `home_base`.
+fn expand_home(pattern: &str, home_base: &str) -> String {
     if let Some(rest) = pattern.strip_prefix("~/") {
-        format!("/Users/*/{rest}")
+        format!("{home_base}/*/{rest}")
     } else if pattern == "~" {
-        "/Users/*".to_string()
+        format!("{home_base}/*")
     } else {
         pattern.to_string()
     }
 }
 
-fn glob(pattern: &str) -> Result<Glob> {
-    Ok(GlobBuilder::new(&expand_home(pattern))
-        .literal_separator(true)
-        .build()?)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::platform::{LINUX, MACOS};
 
     fn node(kind: NodeKind, size: u64, mtime: i64) -> Node {
         let mut n = Node::new("x".into(), kind);
@@ -278,7 +292,7 @@ mod tests {
 
     #[test]
     fn builtin_rules_compile_with_unique_ids() {
-        let rs = RuleSet::builtin().unwrap();
+        let rs = RuleSet::builtin_for(&MACOS).unwrap();
         assert!(rs.rules().len() > 30);
         let mut ids: Vec<_> = rs.rules().iter().map(|r| &r.def.id).collect();
         let n = ids.len();
@@ -289,7 +303,7 @@ mod tests {
 
     #[test]
     fn specific_rules_win_over_generic() {
-        let rs = RuleSet::builtin().unwrap();
+        let rs = RuleSet::builtin_for(&MACOS).unwrap();
         let big = node(NodeKind::Dir, 5 << 30, 0);
         let id = |p: &str| rs.rule_for(p, &big, 0).map(|(_, r)| r.def.id.as_str());
 
@@ -326,7 +340,7 @@ mod tests {
 
     #[test]
     fn conditions_apply() {
-        let rs = RuleSet::builtin().unwrap();
+        let rs = RuleSet::builtin_for(&MACOS).unwrap();
         let now = 1_800_000_000;
         let dmg = "/Users/v/Downloads/Thing.dmg";
         let id = |n: &Node| rs.rule_for(dmg, n, now).map(|(_, r)| r.def.id.clone());
@@ -380,7 +394,7 @@ mod tests {
             why = ""
             how = ""
         "#;
-        let rs = RuleSet::from_sources(&[("test", src)]).unwrap();
+        let rs = RuleSet::from_sources(&MACOS, &[("test", src)]).unwrap();
         let target = dir.join("target").display().to_string();
         let n = node(NodeKind::Dir, 1, 0);
         assert!(rs.rule_for(&target, &n, 0).is_none());
@@ -398,14 +412,20 @@ mod tests {
         let downloads = std::env::temp_dir().join(format!("diskwise-dl-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&downloads);
         std::fs::create_dir_all(&downloads).unwrap();
-        let rerooted = BUILTIN_RULES.replace("~/Downloads", &downloads.display().to_string());
-        let rs = RuleSet::from_sources(&[("rerooted", rerooted.as_str())]).unwrap();
+        let rerooted: Vec<String> = platform::CURRENT
+            .builtin_rule_sources()
+            .iter()
+            .map(|(_, text)| text.replace("~/Downloads", &downloads.display().to_string()))
+            .collect();
+        let sources: Vec<(&str, &str)> =
+            rerooted.iter().map(|t| ("rerooted", t.as_str())).collect();
+        let rs = RuleSet::from_sources(platform::CURRENT, &sources).unwrap();
 
         let rule_for = |name: &str, urls: &[&str]| -> String {
             let f = downloads.join(name);
             std::fs::write(&f, b"x").unwrap();
-            if !urls.is_empty() {
-                set_download_urls(&f, urls);
+            if !urls.is_empty() && !set_download_urls(&f, urls) {
+                return "no-xattr-support".into();
             }
             let n = node(NodeKind::File, 300 << 20, now - 30 * DAY);
             rs.rule_for(&f.display().to_string(), &n, now)
@@ -413,6 +433,14 @@ mod tests {
                 .unwrap_or_default()
         };
 
+        if rule_for("Probe.dmg", &["https://example.com/p.dmg"]) == "no-xattr-support" {
+            eprintln!(
+                "skipping: no extended attribute support in {}",
+                downloads.display()
+            );
+            std::fs::remove_dir_all(&downloads).unwrap();
+            return;
+        }
         assert_eq!(
             rule_for(
                 "Game.dmg",
@@ -453,6 +481,53 @@ mod tests {
     }
 
     #[test]
+    fn linux_rules() {
+        let rs = RuleSet::builtin_for(&LINUX).unwrap();
+        let now = 1_800_000_000;
+        let big = node(NodeKind::Dir, 5 << 30, now);
+        let id = |p: &str| rs.rule_for(p, &big, now).map(|(_, r)| r.def.id.clone());
+
+        assert_eq!(id("/var/cache/apt/archives").as_deref(), Some("apt-cache"));
+        assert_eq!(id("/var/log/journal").as_deref(), Some("systemd-journal"));
+        assert_eq!(id("/var/log/nginx").as_deref(), Some("linux-logs"));
+        assert_eq!(
+            id("/home/v/.cache/pip").as_deref(),
+            Some("package-manager-caches")
+        );
+        // Specific common rules beat the Linux catch-all `~/.cache/*`, although the
+        // Linux file comes first: that's what `fallback` is for.
+        assert_eq!(
+            id("/home/v/.cache/huggingface").as_deref(),
+            Some("ml-models")
+        );
+        assert_eq!(
+            id("/home/v/.cache/thumbnails").as_deref(),
+            Some("linux-user-cache")
+        );
+        // macOS paths mean nothing here.
+        assert_eq!(id("/Users/v/Library/Caches/Google"), None);
+        let deb = node(NodeKind::File, 300 << 20, now - 30 * 86_400);
+        assert_eq!(
+            rs.rule_for("/home/v/Downloads/tool.deb", &deb, now)
+                .map(|(_, r)| r.def.id.as_str()),
+            Some("installer-unknown-source")
+        );
+    }
+
+    #[test]
+    fn fallback_rules_sort_after_specific_ones() {
+        for p in [&MACOS, &LINUX] {
+            let rs = RuleSet::builtin_for(p).unwrap();
+            let first_fallback = rs.rules().iter().position(|r| r.def.fallback).unwrap();
+            assert!(
+                rs.rules()[first_fallback..].iter().all(|r| r.def.fallback),
+                "{}",
+                p.os
+            );
+        }
+    }
+
+    #[test]
     fn user_rule_overrides_builtin_by_id() {
         let user = r#"
             [[rule]]
@@ -465,7 +540,7 @@ mod tests {
             why = ""
             how = ""
         "#;
-        let rs = RuleSet::from_sources(&[("user", user), ("built-in", BUILTIN_RULES)]).unwrap();
+        let rs = RuleSet::with_user_rules(&MACOS, "user", user).unwrap();
         let (_, r) = rs
             .rule_for(
                 "/Users/v/Library/Caches/X",

@@ -12,6 +12,7 @@ diskwise-core = { path = "crates/diskwise-core" }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 globset = "0.4"
+libc = "0.2"
 plist = "1"
 rayon = "1"
 serde = { version = "1", features = ["derive"] }

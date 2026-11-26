@@ -1,19 +1,40 @@
-//! macOS storage facts a file walk can't see: APFS volumes, local snapshots, swap.
+//! Storage facts a file walk can't see. The data types are shared; the probing is
+//! per platform (see `platform`).
 
+use std::ffi::CString;
+use std::os::unix::ffi::OsStrExt;
+use std::path::Path;
 use std::process::Command;
 
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SystemInfo {
+    /// Capacity and free space of the filesystem holding the scan root.
+    #[serde(default)]
+    pub filesystem: Option<FsUsage>,
+    /// macOS: the APFS container and its volumes (they share free space).
+    #[serde(default)]
     pub container: Option<ContainerInfo>,
-    /// Local APFS snapshots (Time Machine, OS updates). Their size isn't reported by macOS.
+    /// Linux: mounted storage filesystems, most used first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mounts: Vec<MountInfo>,
+    /// macOS: local APFS snapshots (Time Machine, OS updates); size not reported.
+    #[serde(default)]
     pub snapshots: Vec<String>,
+    #[serde(default)]
     pub swap: Option<SwapInfo>,
     /// Probes that failed, so missing data isn't silently treated as zero.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct FsUsage {
+    pub capacity: u64,
+    /// Space available to unprivileged users.
+    pub free: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -33,32 +54,54 @@ pub struct VolumeInfo {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MountInfo {
+    pub mount_point: String,
+    pub device: String,
+    pub fs_type: String,
+    pub capacity: u64,
+    pub free: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SwapInfo {
     pub total: u64,
     pub used: u64,
 }
 
-/// Collect system storage info for the APFS container holding `path`.
+/// Collect system storage info relevant to a scan of `path`.
 pub fn probe(path: &str) -> SystemInfo {
-    let mut warnings = Vec::new();
-    let container = container_for(path)
-        .map_err(|e| warnings.push(format!("APFS volumes: {e:#}")))
-        .ok();
-    let snapshots = local_snapshots()
-        .map_err(|e| warnings.push(format!("snapshots: {e:#}")))
-        .unwrap_or_default();
-    let swap = swap_usage()
-        .map_err(|e| warnings.push(format!("swap: {e:#}")))
-        .ok();
-    SystemInfo {
-        container,
-        snapshots,
-        swap,
-        warnings,
+    let mut info = SystemInfo::default();
+    match fs_usage(Path::new(path)) {
+        Ok(u) => info.filesystem = Some(u),
+        Err(e) => info.warnings.push(format!("filesystem: {e:#}")),
     }
+    crate::platform::probe(path, &mut info);
+    info
 }
 
-fn run(cmd: &str, args: &[&str]) -> Result<Vec<u8>> {
+/// Capacity and free space of the filesystem containing `path` (statvfs).
+pub fn fs_usage(path: &Path) -> Result<FsUsage> {
+    let c = CString::new(path.as_os_str().as_bytes()).context("path contains NUL")?;
+    // SAFETY: `c` is a valid NUL-terminated string and `st` is a properly sized,
+    // zero-initialised out-parameter that statvfs fills in.
+    let st = unsafe {
+        let mut st: libc::statvfs = std::mem::zeroed();
+        if libc::statvfs(c.as_ptr(), &mut st) != 0 {
+            return Err(std::io::Error::last_os_error()).context("statvfs");
+        }
+        st
+    };
+    #[allow(clippy::unnecessary_cast)] // field widths differ between platforms
+    let (frsize, blocks, avail) = (st.f_frsize as u64, st.f_blocks as u64, st.f_bavail as u64);
+    Ok(FsUsage {
+        capacity: blocks * frsize,
+        free: avail * frsize,
+    })
+}
+
+/// Run a command and return its stdout, or an error including its stderr.
+#[cfg_attr(target_os = "linux", allow(dead_code))]
+pub(crate) fn run(cmd: &str, args: &[&str]) -> Result<Vec<u8>> {
     let out = Command::new(cmd)
         .args(args)
         .output()
@@ -73,115 +116,13 @@ fn run(cmd: &str, args: &[&str]) -> Result<Vec<u8>> {
     Ok(out.stdout)
 }
 
-fn container_for(path: &str) -> Result<ContainerInfo> {
-    #[derive(Deserialize)]
-    struct Info {
-        #[serde(rename = "APFSContainerReference")]
-        container: String,
-    }
-    #[derive(Deserialize)]
-    struct List {
-        #[serde(rename = "Containers")]
-        containers: Vec<Container>,
-    }
-    #[derive(Deserialize)]
-    struct Container {
-        #[serde(rename = "ContainerReference")]
-        reference: String,
-        #[serde(rename = "CapacityCeiling")]
-        capacity: u64,
-        #[serde(rename = "CapacityFree")]
-        free: u64,
-        #[serde(rename = "Volumes")]
-        volumes: Vec<Volume>,
-    }
-    #[derive(Deserialize)]
-    struct Volume {
-        #[serde(rename = "Name")]
-        name: String,
-        #[serde(rename = "DeviceIdentifier")]
-        device: String,
-        #[serde(rename = "Roles", default)]
-        roles: Vec<String>,
-        #[serde(rename = "CapacityInUse")]
-        used: u64,
-    }
-
-    let info: Info = plist::from_bytes(&run("diskutil", &["info", "-plist", path])?)
-        .context("parsing diskutil info")?;
-    let list: List = plist::from_bytes(&run("diskutil", &["apfs", "list", "-plist"])?)
-        .context("parsing diskutil apfs list")?;
-    let c = list
-        .containers
-        .into_iter()
-        .find(|c| c.reference == info.container)
-        .ok_or_else(|| anyhow!("container {} not found", info.container))?;
-    let mut volumes: Vec<VolumeInfo> = c
-        .volumes
-        .into_iter()
-        .map(|v| VolumeInfo {
-            name: v.name,
-            device: v.device,
-            roles: v.roles,
-            used: v.used,
-        })
-        .collect();
-    volumes.sort_by_key(|v| std::cmp::Reverse(v.used));
-    Ok(ContainerInfo {
-        reference: c.reference,
-        capacity: c.capacity,
-        free: c.free,
-        volumes,
-    })
-}
-
-fn local_snapshots() -> Result<Vec<String>> {
-    let out = run("tmutil", &["listlocalsnapshots", "/"])?;
-    Ok(String::from_utf8_lossy(&out)
-        .lines()
-        .map(str::trim)
-        .filter(|l| l.starts_with("com.apple."))
-        .map(String::from)
-        .collect())
-}
-
-fn swap_usage() -> Result<SwapInfo> {
-    let out = run("sysctl", &["-n", "vm.swapusage"])?;
-    parse_swap(&String::from_utf8_lossy(&out))
-}
-
-/// Parses `total = 3072.00M  used = 1370.56M  free = 1701.44M  (encrypted)`.
-fn parse_swap(s: &str) -> Result<SwapInfo> {
-    let field = |key: &str| -> Result<u64> {
-        let rest = s
-            .split(&format!("{key} = "))
-            .nth(1)
-            .ok_or_else(|| anyhow!("no {key} in {s:?}"))?;
-        let token = rest.split_whitespace().next().unwrap_or("");
-        let (num, unit) = token.split_at(token.len().saturating_sub(1));
-        let mult: f64 = match unit {
-            "K" => 1024.0,
-            "M" => 1024.0 * 1024.0,
-            "G" => 1024.0 * 1024.0 * 1024.0,
-            _ => return Err(anyhow!("unknown unit in {token:?}")),
-        };
-        Ok((num.parse::<f64>()? * mult) as u64)
-    };
-    Ok(SwapInfo {
-        total: field("total")?,
-        used: field("used")?,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn parses_swapusage() {
-        let s =
-            parse_swap("total = 3072.00M  used = 1370.56M  free = 1701.44M  (encrypted)").unwrap();
-        assert_eq!(s.total, 3072 * 1024 * 1024);
-        assert!(s.used > 1370 * 1024 * 1024 && s.used < 1371 * 1024 * 1024);
+    fn fs_usage_of_root() {
+        let u = fs_usage(Path::new("/")).unwrap();
+        assert!(u.capacity > 0 && u.free <= u.capacity);
     }
 }

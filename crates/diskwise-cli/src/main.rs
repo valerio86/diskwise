@@ -4,7 +4,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use diskwise_core::rules::{BUILTIN_RULES, Safety};
+use diskwise_core::platform::{self, Platform};
+use diskwise_core::rules::Safety;
 use diskwise_core::suggest::Item;
 use diskwise_core::{
     DEFAULT_ROOT, Finding, Node, NodeKind, RuleSet, ScanOptions, Snapshot, human_bytes, parse_size,
@@ -71,6 +72,9 @@ enum Command {
         /// Your own rules file (TOML), listed first.
         #[arg(long)]
         rules: Option<PathBuf>,
+        /// Show another platform's rules: macos or linux.
+        #[arg(long)]
+        os: Option<String>,
     },
 }
 
@@ -123,7 +127,6 @@ fn main() -> Result<()> {
             compact,
             json,
         } => {
-            let ruleset = load_rules(rules.as_deref())?;
             let snap = match from {
                 Some(file) => load_snapshot(&file)?,
                 None => {
@@ -136,6 +139,8 @@ fn main() -> Result<()> {
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_secs() as i64)
                 .unwrap_or(0);
+            // Use the rules of the platform the snapshot came from.
+            let ruleset = load_rules(snap.platform(), rules.as_deref())?;
             let findings = diskwise_core::analyze(&snap, &ruleset, now);
             if json {
                 println!("{}", serde_json::to_string_pretty(&findings)?);
@@ -145,8 +150,13 @@ fn main() -> Result<()> {
                 print_findings(&findings, items);
             }
         }
-        Command::Rules { rules } => {
-            for r in load_rules(rules.as_deref())?.rules() {
+        Command::Rules { rules, os } => {
+            let p = match os.as_deref() {
+                None => platform::CURRENT,
+                Some(name) => Platform::by_name(name)
+                    .with_context(|| format!("unknown platform {name:?} (try macos or linux)"))?,
+            };
+            for r in load_rules(p, rules.as_deref())?.rules() {
                 let d = &r.def;
                 println!(
                     "{:<28} {:<8} {:<11} {}",
@@ -163,17 +173,13 @@ fn load_snapshot(file: &Path) -> Result<Snapshot> {
     serde_json::from_slice(&bytes).context("parsing snapshot")
 }
 
-/// Built-in rules, with the user's file (if any) taking priority.
-fn load_rules(user: Option<&Path>) -> Result<RuleSet> {
+/// Built-in rules for `platform`, with the user's file (if any) taking priority.
+fn load_rules(platform: &Platform, user: Option<&Path>) -> Result<RuleSet> {
     match user {
-        None => RuleSet::builtin(),
+        None => RuleSet::builtin_for(platform),
         Some(p) => {
             let text = fs::read_to_string(p).with_context(|| format!("reading {}", p.display()))?;
-            let name = p.display().to_string();
-            RuleSet::from_sources(&[
-                (name.as_str(), text.as_str()),
-                ("built-in rules", BUILTIN_RULES),
-            ])
+            RuleSet::with_user_rules(platform, &p.display().to_string(), &text)
         }
     }
 }
@@ -339,6 +345,32 @@ fn print_report(snap: &Snapshot, view: &ViewArgs) {
     );
 
     if let Some(sys) = &snap.system {
+        if sys.container.is_none()
+            && let Some(fs) = &sys.filesystem
+        {
+            let used = fs.capacity.saturating_sub(fs.free);
+            println!(
+                "\nFilesystem: {} used of {}, {} free ({:.0}% full)",
+                human_bytes(used),
+                human_bytes(fs.capacity),
+                human_bytes(fs.free),
+                used as f64 / fs.capacity.max(1) as f64 * 100.0
+            );
+        }
+        if !sys.mounts.is_empty() {
+            println!("\nMounted filesystems:");
+            for m in &sys.mounts {
+                let used = m.capacity.saturating_sub(m.free);
+                println!(
+                    "  {:>10} used of {:>10} ({:>3.0}%)  {} [{}]",
+                    human_bytes(used),
+                    human_bytes(m.capacity),
+                    used as f64 / m.capacity.max(1) as f64 * 100.0,
+                    m.mount_point,
+                    m.fs_type
+                );
+            }
+        }
         if let Some(c) = &sys.container {
             let used = c.capacity.saturating_sub(c.free);
             println!(
@@ -362,7 +394,7 @@ fn print_report(snap: &Snapshot, view: &ViewArgs) {
                 .volumes
                 .iter()
                 .find(|v| v.roles.iter().any(|r| r == "Data"))
-                && snap.root == DEFAULT_ROOT
+                && snap.root == platform::MACOS.default_root
                 && data.used > t.allocated
             {
                 println!(
@@ -395,13 +427,24 @@ fn print_report(snap: &Snapshot, view: &ViewArgs) {
         }
     }
 
+    if !snap.skipped_mounts.is_empty() {
+        println!("\nNot scanned (separate filesystems; scan them directly or use --cross-mounts):");
+        for m in &snap.skipped_mounts {
+            println!("  {}", snap.platform().display_path(m));
+        }
+    }
+
     println!("\nLargest items:");
     print_tree(t, 0, view, t.allocated);
 
     if snap.errors.count > 0 {
+        let hint = if snap.platform().os == "macos" {
+            "grant your terminal Full Disk Access\n(System Settings → Privacy & Security → Full Disk Access)"
+        } else {
+            "run as root (sudo) to include other users' files"
+        };
         println!(
-            "\n{} paths could not be read. If this is high, grant your terminal Full Disk Access\n\
-             (System Settings → Privacy & Security → Full Disk Access). First few:",
+            "\n{} paths could not be read. If this is high, {hint}. First few:",
             snap.errors.count
         );
         for s in snap.errors.samples.iter().take(5) {

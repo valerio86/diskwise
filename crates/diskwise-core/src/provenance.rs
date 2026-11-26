@@ -1,24 +1,19 @@
-//! Where a file was downloaded from, as recorded by macOS.
+//! Where a file was downloaded from, as recorded by the OS.
 //!
-//! Browsers and other downloaders set the `com.apple.metadata:kMDItemWhereFroms`
-//! extended attribute: a binary plist array of URLs (the file URL, then usually the
-//! page it was linked from). These URLs can embed purchase keys and tokens, so only
-//! host names ever leave this module.
+//! macOS browsers set `com.apple.metadata:kMDItemWhereFroms`; on Linux, Chromium
+//! browsers, wget and curl can set `user.xdg.origin.url` / `user.xdg.referrer.url`.
+//! These URLs can embed purchase keys and tokens, so only host names ever leave
+//! this module.
 
 use std::path::Path;
-
-pub const WHERE_FROMS_ATTR: &str = "com.apple.metadata:kMDItemWhereFroms";
 
 /// Host names of the URLs the file was downloaded from, in recorded order.
 /// Empty when nothing was recorded or the attribute can't be read.
 pub fn download_hosts(path: &Path) -> Vec<String> {
-    let Ok(Some(bytes)) = xattr::get(path, WHERE_FROMS_ATTR) else {
-        return Vec::new();
-    };
-    let Ok(urls) = plist::from_bytes::<Vec<String>>(&bytes) else {
-        return Vec::new();
-    };
-    let mut hosts: Vec<String> = urls.iter().filter_map(|u| host_of(u)).collect();
+    let mut hosts: Vec<String> = crate::platform::download_urls(path)
+        .iter()
+        .filter_map(|u| host_of(u))
+        .collect();
     hosts.dedup();
     hosts
 }
@@ -51,11 +46,11 @@ pub fn host_matches(host: &str, domain: &str) -> bool {
             .is_some_and(|prefix| prefix.ends_with('.'))
 }
 
+/// Record download URLs on a file the way this platform's browsers do. Returns
+/// false if the filesystem doesn't support extended attributes (tests skip then).
 #[cfg(test)]
-pub(crate) fn set_download_urls(path: &Path, urls: &[&str]) {
-    let mut buf = Vec::new();
-    plist::to_writer_binary(&mut buf, &urls).unwrap();
-    xattr::set(path, WHERE_FROMS_ATTR, &buf).unwrap();
+pub(crate) fn set_download_urls(path: &Path, urls: &[&str]) -> bool {
+    crate::platform::set_download_urls(path, urls)
 }
 
 #[cfg(test)]
@@ -89,17 +84,18 @@ mod tests {
         let f = std::env::temp_dir().join(format!("diskwise-prov-{}", std::process::id()));
         std::fs::write(&f, b"x").unwrap();
         assert!(download_hosts(&f).is_empty());
-        set_download_urls(
-            &f,
-            &[
-                "https://dl.humble.com/a.dmg?gamekey=SECRET",
-                "https://www.humblebundle.com/downloads",
-            ],
-        );
-        assert_eq!(
-            download_hosts(&f),
-            vec!["dl.humble.com", "www.humblebundle.com"]
-        );
+        let urls = [
+            "https://dl.humble.com/a.dmg?gamekey=SECRET",
+            "https://www.humblebundle.com/downloads",
+        ];
+        if set_download_urls(&f, &urls) {
+            assert_eq!(
+                download_hosts(&f),
+                vec!["dl.humble.com", "www.humblebundle.com"]
+            );
+        } else {
+            eprintln!("skipping: no extended attribute support in {}", f.display());
+        }
         std::fs::remove_file(&f).unwrap();
     }
 }
