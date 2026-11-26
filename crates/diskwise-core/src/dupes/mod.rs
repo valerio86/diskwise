@@ -177,6 +177,12 @@ pub struct Copy {
     /// Inside a synced folder: deleting it deletes it everywhere.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub synced: bool,
+    /// Device it's on, and whether that filesystem can clone: whether "store
+    /// once" against a given keeper is possible.
+    #[serde(default)]
+    pub dev: u64,
+    #[serde(default)]
+    pub can_clone: bool,
 }
 
 /// What diskwise suggests for an extra copy.
@@ -503,6 +509,8 @@ fn build_group(
                 shared,
                 action: None,
                 synced: false,
+                dev: l.file.dev,
+                can_clone: l.can_clone,
             };
             (copy, l.file.dev, l.can_clone)
         })
@@ -531,7 +539,7 @@ fn rank(
     ctx: &Ctx,
     keep_first: &dyn Fn(&str) -> bool,
 ) -> Vec<Copy> {
-    let (prefer, home_base) = (ctx.prefs.prefer, ctx.home_base);
+    let prefer = ctx.prefs.prefer;
     // The user's "prefer folder A over B" choices, as a score per copy.
     let paths: Vec<String> = copies.iter().map(|(c, _, _)| c.path.clone()).collect();
     let score: HashMap<String, i32> = paths
@@ -565,10 +573,20 @@ fn rank(
             .then_with(|| shared(&b.0).cmp(&shared(&a.0)))
             .then_with(|| keep_order(&a.0, &b.0, prefer))
     });
-    let (keeper, keeper_dev, _) = &copies[0];
-    let (keeper_path, keeper_dev) = (keeper.path.clone(), *keeper_dev);
+    let mut copies: Vec<Copy> = copies.into_iter().map(|(c, _, _)| c).collect();
+    assign_actions(&mut copies, ctx);
+    copies
+}
+
+/// Set each extra copy's suggested action against the keeper (`copies[0]`).
+fn assign_actions(copies: &mut [Copy], ctx: &Ctx) {
+    let home_base = ctx.home_base;
+    let keeper_path = copies[0].path.clone();
+    let keeper_dev = copies[0].dev;
+    copies[0].action = None;
     let keeper_in_downloads = in_downloads(&keeper_path, home_base);
-    for (c, dev, can_clone) in &mut copies[1..] {
+    for c in &mut copies[1..] {
+        let (dev, can_clone) = (&c.dev, &c.can_clone);
         c.synced = ctx
             .synced
             .iter()
@@ -592,11 +610,28 @@ fn rank(
             Action::Review
         });
     }
-    copies.into_iter().map(|(c, _, _)| c).collect()
+}
+
+/// Make `copies[index]` the keeper of a group (the user's choice), and work out
+/// the other copies' actions again. Returns the new reclaimable total.
+pub fn set_keeper(copies: &mut [Copy], index: usize, prefs: &Prefs, snap: &Snapshot) -> u64 {
+    copies[..=index].rotate_right(1);
+    let ctx = Ctx {
+        prefs,
+        home_base: snap.platform().home_base,
+        synced: &snap.synced_roots,
+    };
+    assign_actions(copies, &ctx);
+    reclaimable(copies)
+}
+
+/// Whether "store once" is possible for `copy` against `keeper`.
+pub fn can_store_once(keeper: &Copy, copy: &Copy) -> bool {
+    copy.can_clone && copy.dev == keeper.dev && copy.frees > 0
 }
 
 /// Space freed by acting on every extra copy that isn't kept as it is.
-pub(crate) fn reclaimable(copies: &[Copy]) -> u64 {
+pub fn reclaimable(copies: &[Copy]) -> u64 {
     copies[1..]
         .iter()
         .filter(|c| c.action != Some(Action::Keep))
@@ -1128,6 +1163,27 @@ mod tests {
             .find(|g| g.copies[0].path == p("Archive/a.jpg"))
             .unwrap();
         assert!(k.copies[1..].iter().all(|c| c.action == Some(Action::Keep)));
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn swapping_the_keeper_recomputes_actions() {
+        let d = dir("swap");
+        let a = content(13, 2 << 20);
+        write(&d.join("Projects/x/a.jpg"), &a);
+        write(&d.join("Downloads/a.jpg"), &a);
+        // (Otherwise the two folders are identical and reported as a folder.)
+        write(&d.join("Projects/x/notes.txt"), b"only here");
+        let snap = scan(&d);
+        let r = find(&snap, None, None, &Prefs::default());
+        let mut copies = r.groups[0].copies.clone();
+        let before = copies[0].path.clone();
+        let total = set_keeper(&mut copies, 1, &Prefs::default(), &snap);
+        assert_ne!(copies[0].path, before);
+        assert_eq!(copies[0].action, None);
+        assert_eq!(copies[1].path, before);
+        assert!(copies[1].action.is_some());
+        assert!(total > 0);
         std::fs::remove_dir_all(&d).unwrap();
     }
 

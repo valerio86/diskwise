@@ -163,6 +163,8 @@ pub(super) fn find(
                     shared: None,
                     action: None,
                     synced: false,
+                    dev: meta.dev(),
+                    can_clone: crate::platform::can_clone(&real),
                 };
                 Some((copy, meta.dev(), crate::platform::can_clone(&real)))
             })

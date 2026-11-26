@@ -18,8 +18,9 @@ use ratatui::widgets::{
     Wrap,
 };
 
-use super::app::{App, Modal, Tab};
+use super::app::{App, DupeState, Modal, Tab};
 use super::theme::th;
+use diskwise_core::dupes::Action as DupeAction;
 
 const DETAILS_HEIGHT: u16 = 8;
 const BAR_WIDTH: usize = 12;
@@ -86,6 +87,10 @@ pub fn draw(f: &mut Frame, app: &App) {
             draw_suggestions(f, app, main);
             draw_suggestion_details(f, app, details);
         }
+        Tab::Duplicates => {
+            draw_dupes(f, app, main);
+            draw_dupe_details(f, app, details);
+        }
     }
     draw_footer(f, app, footer);
     if let Some(m) = &app.modal {
@@ -120,6 +125,15 @@ fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
             ),
             Span::raw("  "),
             tab("Browse".into(), app.tab == Tab::Browse),
+            Span::raw("  "),
+            tab(
+                match &app.dupe_state {
+                    DupeState::Ready { .. } => format!("Duplicates · {}", app.dupe_groups.len()),
+                    DupeState::Checking { .. } => "Duplicates …".into(),
+                    _ => "Duplicates".into(),
+                },
+                app.tab == Tab::Duplicates,
+            ),
             Span::styled("   tab to switch", muted()),
         ]),
         left,
@@ -158,6 +172,42 @@ fn draw_location(f: &mut Frame, app: &App, area: Rect) {
         Tab::Suggestions => (
             "What you could clean up".to_string(),
             "Safest first · ⏎ shows an item in the browser".to_string(),
+        ),
+        Tab::Duplicates => (
+            "Copies of the same folders and files".to_string(),
+            match &app.dupe_state {
+                DupeState::Checking { progress, .. } => {
+                    use std::sync::atomic::Ordering::Relaxed;
+                    let (done, total) = (
+                        progress.done_bytes.load(Relaxed),
+                        progress.total_bytes.load(Relaxed),
+                    );
+                    if total == 0 {
+                        "Looking for files with the same size …".to_string()
+                    } else {
+                        format!(
+                            "Comparing contents: {} of {} …",
+                            human_bytes(done),
+                            human_bytes(total)
+                        )
+                    }
+                }
+                DupeState::Ready { shared, kept } => {
+                    let mut s = format!(
+                        "{} reclaimable · folders first · the first copy is kept",
+                        human_bytes(app.dupes_reclaimable())
+                    );
+                    if *kept > 0 {
+                        s.push_str(&format!(" · {kept} kept as they are"));
+                    }
+                    if *shared > 0 {
+                        s.push_str(&format!(" · {shared} already shared"));
+                    }
+                    s
+                }
+                DupeState::Unavailable(why) => why.clone(),
+                DupeState::NotStarted => String::new(),
+            },
         ),
     };
     f.render_widget(
@@ -538,6 +588,150 @@ fn draw_suggestion_details(f: &mut Frame, app: &App, area: Rect) {
     );
 }
 
+/// What a duplicate copy's action is called, and its colour.
+fn dupe_label(i: usize, action: Option<DupeAction>) -> (&'static str, Style) {
+    match (i, action) {
+        (0, _) => ("keep", accent().bold()),
+        (_, Some(DupeAction::Trash)) => ("trash", Style::new().fg(th().caution)),
+        (_, Some(DupeAction::StoreOnce)) => ("store once", Style::new().fg(th().safe)),
+        (_, Some(DupeAction::Review)) => ("your call", Style::new().fg(th().review)),
+        (_, Some(DupeAction::Keep)) => ("keep as is", muted()),
+        (_, Some(DupeAction::Nothing) | None) => ("shared", muted()),
+    }
+}
+
+/// Shorten a path to `width` characters by cutting out the middle, so both
+/// where it is and what it's called stay visible.
+fn middle_ellipsis(path: &str, width: usize) -> String {
+    let chars: Vec<char> = path.chars().collect();
+    if chars.len() <= width || width < 5 {
+        return path.to_string();
+    }
+    let tail = (width - 1) * 3 / 5;
+    let head = width - 1 - tail;
+    let mut s: String = chars[..head].iter().collect();
+    s.push('…');
+    s.extend(&chars[chars.len() - tail..]);
+    s
+}
+
+fn draw_dupes(f: &mut Frame, app: &App, area: Rect) {
+    const PLAN_WIDTH: u16 = 24;
+    // Size, copies, kind and plan columns, spacing, and the selection pointer.
+    let path_width = area
+        .width
+        .saturating_sub(9 + 9 + 18 + PLAN_WIDTH + 2 * 4 + 2) as usize;
+    if app.dupe_groups.is_empty() {
+        let msg = match &app.dupe_state {
+            DupeState::Ready { .. } => " No duplicates that would free space.",
+            DupeState::Checking { .. } => " Checking …",
+            _ => "",
+        };
+        f.render_widget(Paragraph::new(Span::styled(msg, muted())), area);
+        return;
+    }
+    let rows: Vec<Row> = app
+        .dupe_groups
+        .iter()
+        .enumerate()
+        .map(|(i, g)| {
+            let mut counts: Vec<(&str, usize)> = Vec::new();
+            for (j, c) in g.copies.iter().enumerate().skip(1) {
+                let (label, _) = dupe_label(j, c.action);
+                match counts.iter_mut().find(|(l, _)| *l == label) {
+                    Some((_, n)) => *n += 1,
+                    None => counts.push((label, 1)),
+                }
+            }
+            let plan = counts
+                .iter()
+                .map(|(l, n)| format!("{n} {l}"))
+                .collect::<Vec<_>>()
+                .join(" · ");
+            let what = if g.folder {
+                format!("folder · {} files", g.files)
+            } else {
+                format!("file · {}", human_bytes(g.size))
+            };
+            Row::new(vec![
+                Cell::from(Line::from(human_bytes(g.reclaimable)).right_aligned()),
+                Cell::from(format!("{} copies", g.copies.len())),
+                Cell::from(Span::styled(what, muted())),
+                Cell::from(middle_ellipsis(&tilde(&g.copies[0].path), path_width)),
+                Cell::from(Span::styled(plan, muted())),
+            ])
+            .style(if i == app.dupe_sel {
+                th().selected()
+            } else {
+                Style::new()
+            })
+        })
+        .collect();
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(9),
+            Constraint::Length(9),
+            Constraint::Length(18),
+            Constraint::Fill(1),
+            Constraint::Length(PLAN_WIDTH),
+        ],
+    );
+    let mut state = TableState::default().with_selected(Some(app.dupe_sel));
+    f.render_stateful_widget(selection_table(table), area, &mut state);
+}
+
+fn draw_dupe_details(f: &mut Frame, app: &App, area: Rect) {
+    let block = section("Copies");
+    let Some(g) = app.selected_group() else {
+        f.render_widget(Paragraph::new("").block(block), area);
+        return;
+    };
+    // One line per copy around the selected one, then what its action means.
+    let room = area.height.saturating_sub(3) as usize;
+    let start = app
+        .copy_sel
+        .saturating_sub(room.saturating_sub(1))
+        .min(g.copies.len().saturating_sub(room));
+    let mut lines = Vec::new();
+    for (i, c) in g.copies.iter().enumerate().skip(start).take(room) {
+        let (label, style) = dupe_label(i, c.action);
+        let pointer = if i == app.copy_sel { "❯ " } else { "  " };
+        let note = match c.shared {
+            _ if c.synced => "  (synced folder)",
+            Some(diskwise_core::dupes::Shared::HardLink) => "  (hard link)",
+            Some(diskwise_core::dupes::Shared::Clone) => "  (partly shared)",
+            None => "",
+        };
+        let row = Line::from(vec![
+            Span::styled(pointer, accent().bold()),
+            Span::styled(format!("{label:<11}"), style),
+            Span::raw(format!(
+                "{}{}",
+                tilde(&c.path),
+                if g.folder { "/" } else { "" }
+            )),
+            Span::styled(note, muted()),
+        ]);
+        lines.push(if i == app.copy_sel {
+            row.style(Style::new().bold())
+        } else {
+            row
+        });
+    }
+    let sel = &g.copies[app.copy_sel.min(g.copies.len() - 1)];
+    let explain = match (app.copy_sel, sel.action) {
+        (0, _) => "This copy stays as it is. p on another copy keeps that one instead.".to_string(),
+        (_, Some(DupeAction::Trash)) => "Will go to the Trash: a stray copy (named like a copy, or left in Downloads). space to change.".into(),
+        (_, Some(DupeAction::StoreOnce)) => "Will become a clone of the kept copy: both paths keep working, stored once. space to change.".into(),
+        (_, Some(DupeAction::Review)) => "Nothing says which copy is the stray: space to choose.".into(),
+        (_, Some(DupeAction::Keep)) => "Kept as it is, and remembered. space to change.".into(),
+        _ => "Already shares its storage with the kept copy.".into(),
+    };
+    lines.push(Line::from(Span::styled(format!("  {explain}"), muted())));
+    f.render_widget(Paragraph::new(lines).block(block), area);
+}
+
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     let line = match &app.status {
         Some(s) => Line::from(Span::styled(format!(" {s}"), Style::new().fg(th().caution))),
@@ -559,6 +753,16 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
                 ("r", "rescan"),
                 ("?", "help"),
                 ("q", "quit"),
+            ]),
+            Tab::Duplicates => key_hints(&[
+                ("↑↓", "group"),
+                ("←→", "copy"),
+                ("space", "change"),
+                ("p", "keep this"),
+                ("i", "intentional"),
+                ("d", "do it"),
+                ("⏎", "show"),
+                ("?", "help"),
             ]),
         }),
     };
@@ -591,7 +795,10 @@ fn draw_modal(f: &mut Frame, modal: &Modal) {
             (
                 "Keys".to_string(),
                 Text::from(vec![
-                    row("tab  1  2", "switch between Suggestions and Browse"),
+                    row(
+                        "tab  1  2  3",
+                        "switch between Suggestions, Browse and Duplicates",
+                    ),
                     row("↑ ↓  j k", "move (PgUp / PgDn move faster)"),
                     row("⏎ → l", "open folder · show suggestion in the browser"),
                     row("← h ⌫", "up one folder"),
@@ -599,6 +806,19 @@ fn draw_modal(f: &mut Frame, modal: &Modal) {
                     row("s", "sort: size → name → oldest first"),
                     row("r", "rescan"),
                     row("q esc", "quit"),
+                    Line::from(""),
+                    Line::from(Span::styled("Duplicates", Style::new().bold())),
+                    row("← →", "pick a copy (the first one is kept)"),
+                    row(
+                        "space",
+                        "change what happens to it: trash, store once, keep as is",
+                    ),
+                    row(
+                        "p",
+                        "keep this copy instead (and maybe always prefer its folder)",
+                    ),
+                    row("i", "mark a folder's duplicates as intentional"),
+                    row("d", "do what's chosen for the group (asks first)"),
                     Line::from(""),
                     Line::from(vec![
                         Span::styled("● safe", safety_style(Safety::Safe)),
@@ -662,6 +882,119 @@ fn draw_modal(f: &mut Frame, modal: &Modal) {
                 "Move to Trash?".to_string(),
                 Text::from(lines),
                 th().caution,
+            )
+        }
+        Modal::ConfirmDupes { plan, warning } => {
+            let total: u64 = plan.iter().map(|p| p.bytes).sum();
+            let mut lines = Vec::new();
+            if let Some(first) = plan.first() {
+                lines.push(Line::from(vec![
+                    Span::styled(format!("{:>11}  ", "keep"), accent().bold()),
+                    Span::raw(tilde(&first.target.keeper)),
+                ]));
+            }
+            for p in plan.iter().take(8) {
+                let (label, style) = match p.how {
+                    diskwise_core::dupes::act::How::Trash => {
+                        ("trash", Style::new().fg(th().caution))
+                    }
+                    diskwise_core::dupes::act::How::StoreOnce => {
+                        ("store once", Style::new().fg(th().safe))
+                    }
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(format!("{label:>11}  "), style.bold()),
+                    Span::raw(tilde(&p.target.copy)),
+                    Span::styled(format!("  {}", human_bytes(p.bytes)), muted()),
+                ]));
+            }
+            if plan.len() > 8 {
+                lines.push(Line::from(Span::styled(
+                    format!("             … and {} more", plan.len() - 8),
+                    muted(),
+                )));
+            }
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                format!("{} freed in total", human_bytes(total)),
+                Style::new().bold(),
+            )));
+            lines.push(Line::from(Span::styled(
+                "Each copy is checked again first: it must still match the kept one exactly.",
+                muted(),
+            )));
+            if let Some(w) = warning {
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    w.clone(),
+                    Style::new().fg(th().caution),
+                )));
+            }
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![
+                key_pill("y", th().caution),
+                Span::raw(" go ahead     "),
+                key_pill("n", th().muted),
+                Span::raw(" cancel"),
+            ]));
+            (
+                "Deal with these copies?".to_string(),
+                Text::from(lines),
+                th().caution,
+            )
+        }
+        Modal::PreferFolder { prefer, over } => (
+            "Remember this?".to_string(),
+            Text::from(vec![
+                Line::from("Always keep copies in"),
+                Line::from(Span::styled(
+                    format!("  {}", tilde(prefer)),
+                    Style::new().bold(),
+                )),
+                Line::from("over copies in"),
+                Line::from(Span::styled(
+                    format!("  {}", tilde(over)),
+                    Style::new().bold(),
+                )),
+                Line::from(""),
+                Line::from(vec![
+                    key_pill("y", th().accent),
+                    Span::raw(" always     "),
+                    key_pill("n", th().muted),
+                    Span::raw(" just this time"),
+                ]),
+            ]),
+            th().accent,
+        ),
+        Modal::ChooseFolder { options, selected } => {
+            let mut lines = vec![
+                Line::from("Which folder's duplicates are intentional? Copies inside it will be"),
+                Line::from("kept as they are and no longer suggested."),
+                Line::from(""),
+            ];
+            for (i, o) in options.iter().enumerate() {
+                let pointer = if i == *selected { "❯ " } else { "  " };
+                let style = if i == *selected {
+                    Style::new().bold()
+                } else {
+                    Style::new()
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(pointer, accent().bold()),
+                    Span::styled(tilde(o), style),
+                ]));
+            }
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![
+                key_pill("⏎", th().accent),
+                Span::raw(" choose     "),
+                key_pill("esc", th().muted),
+                Span::raw(" cancel"),
+            ]));
+            (
+                "Intentional duplicates".to_string(),
+                Text::from(lines),
+                th().accent,
             )
         }
     };
@@ -770,6 +1103,18 @@ mod tests {
     /// DISKWISE_RENDER_DIR to also write each screen's cells as JSON):
     /// DISKWISE_SNAPSHOT=snap.json cargo test -p diskwise-cli render_real -- --ignored --nocapture
     #[test]
+    fn middle_ellipsis_keeps_both_ends() {
+        let p = "~/Development/stilson-road/originals/frames/1VDJNC0020081.tif.gz";
+        let s = middle_ellipsis(p, 40);
+        assert_eq!(s.chars().count(), 40);
+        assert!(
+            s.starts_with("~/Devel") && s.ends_with("1VDJNC0020081.tif.gz"),
+            "{s}"
+        );
+        assert_eq!(middle_ellipsis("short", 40), "short");
+    }
+
+    #[test]
     #[ignore]
     fn render_real_snapshot() {
         if let Ok(c) = std::env::var("DISKWISE_COLOR") {
@@ -793,12 +1138,22 @@ mod tests {
             "{home}/Library/Application Support/Google/GoogleUpdater"
         ));
         show("browse", &app);
-        app.toggle_tab();
+        app.toggle_tab_back();
         show("suggestions", &app);
         app.reveal(&format!("{home}/Library/Caches"));
         app.open();
         app.request_trash();
         show("confirm", &app);
+        app.modal = None;
+        let report = diskwise_core::dupes::find(&app.snap, None, None, &app.prefs.clone());
+        app.set_dupes(report);
+        app.tab = Tab::Duplicates;
+        show("dupes", &app);
+        app.move_dupe(1);
+        app.move_copy(1);
+        show("dupes-copy", &app);
+        app.request_dupe_actions();
+        show("dupes-confirm", &app);
     }
 
     #[test]
@@ -843,7 +1198,7 @@ mod tests {
             screen.contains("cache/") && screen.contains("● cache"),
             "{screen}"
         );
-        app.toggle_tab();
+        app.toggle_tab_back();
         let screen = render(&app, 180, 30);
         assert!(
             screen.contains("Suggestions · 3") && screen.contains("safe"),

@@ -7,10 +7,14 @@ use diskwise_core::actions::{Protection, check_trash};
 use diskwise_core::rules::{Action, Safety};
 use diskwise_core::{Finding, Node, NodeKind, Platform, Snapshot};
 
+mod dupes;
+pub use dupes::{DupeGroup, DupeState, PlanItem};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
     Browse,
     Suggestions,
+    Duplicates,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,6 +62,21 @@ pub enum Modal {
         /// Shown prominently; None means "nothing is lost".
         warning: Option<String>,
     },
+    /// Carry out a duplicate group's chosen actions.
+    ConfirmDupes {
+        plan: Vec<PlanItem>,
+        warning: Option<String>,
+    },
+    /// After the user picked another keeper: remember it for these folders?
+    PreferFolder {
+        prefer: String,
+        over: String,
+    },
+    /// Which folder holds intentional duplicates.
+    ChooseFolder {
+        options: Vec<String>,
+        selected: usize,
+    },
 }
 
 /// The suggestion that covers a path, directly or through an ancestor.
@@ -91,6 +110,15 @@ pub struct App {
     /// another machine, so nothing is moved to the Trash until a rescan.
     pub live: bool,
     protection: Protection,
+    // ── Duplicates tab ──
+    pub dupe_state: DupeState,
+    pub dupe_groups: Vec<DupeGroup>,
+    pub dupe_sel: usize,
+    /// Which copy of the selected group is selected (0 = the keeper).
+    pub copy_sel: usize,
+    pub prefs: diskwise_core::dupes::Prefs,
+    prefs_path: Option<std::path::PathBuf>,
+    dupe_cache: Option<std::path::PathBuf>,
 }
 
 impl App {
@@ -121,6 +149,15 @@ impl App {
             rescan_requested: false,
             live: true,
             protection: Protection::for_platform(platform),
+            dupe_state: DupeState::NotStarted,
+            dupe_groups: Vec::new(),
+            dupe_sel: 0,
+            copy_sel: 0,
+            prefs: dupes::prefs_location()
+                .map(|p| diskwise_core::dupes::Prefs::load(&p))
+                .unwrap_or_default(),
+            prefs_path: dupes::prefs_location(),
+            dupe_cache: dupes::cache_location(),
         };
         // The scanner sorts "(smaller items)" by size like everything else; here it
         // always goes last.
@@ -237,6 +274,7 @@ impl App {
         match self.tab {
             Tab::Browse => self.selected = step(self.selected, delta, self.entries().len()),
             Tab::Suggestions => self.suggestion = step(self.suggestion, delta, self.findings.len()),
+            Tab::Duplicates => self.move_dupe(delta),
         }
     }
 
@@ -244,6 +282,7 @@ impl App {
         match self.tab {
             Tab::Browse => self.selected = 0,
             Tab::Suggestions => self.suggestion = 0,
+            Tab::Duplicates => self.move_dupe(isize::MIN / 2),
         }
     }
 
@@ -251,6 +290,7 @@ impl App {
         match self.tab {
             Tab::Browse => self.selected = self.entries().len().saturating_sub(1),
             Tab::Suggestions => self.suggestion = self.findings.len().saturating_sub(1),
+            Tab::Duplicates => self.move_dupe(isize::MAX / 2),
         }
     }
 
@@ -296,6 +336,7 @@ impl App {
                 };
                 self.reveal(&path);
             }
+            Tab::Duplicates => self.reveal_copy(),
         }
     }
 
@@ -341,8 +382,17 @@ impl App {
 
     pub fn toggle_tab(&mut self) {
         self.tab = match self.tab {
-            Tab::Browse => Tab::Suggestions,
             Tab::Suggestions => Tab::Browse,
+            Tab::Browse => Tab::Duplicates,
+            Tab::Duplicates => Tab::Suggestions,
+        };
+    }
+
+    pub fn toggle_tab_back(&mut self) {
+        self.tab = match self.tab {
+            Tab::Suggestions => Tab::Duplicates,
+            Tab::Browse => Tab::Suggestions,
+            Tab::Duplicates => Tab::Browse,
         };
     }
 
@@ -372,6 +422,7 @@ impl App {
             return;
         }
         match self.tab {
+            Tab::Duplicates => self.request_dupe_actions(),
             Tab::Browse => {
                 let Some(node) = self.selected_node() else {
                     return;
@@ -644,6 +695,21 @@ fn warning_for(f: &Finding, direct: bool) -> Option<String> {
         (Safety::Review, _) => Some(format!("Review first{inside}: {}", f.how)),
         (Safety::Caution, _) => Some(format!("Before you confirm{inside}: {}", f.how)),
         (Safety::Safe, _) => None,
+    }
+}
+
+/// `~/…` for paths in the user's home folder.
+pub fn tilde_path(path: &str) -> String {
+    match std::env::var("HOME") {
+        Ok(home) if !home.is_empty() && path.starts_with(&home) => {
+            let rest = &path[home.len()..];
+            if rest.is_empty() || rest.starts_with('/') {
+                format!("~{rest}")
+            } else {
+                path.into()
+            }
+        }
+        _ => path.into(),
     }
 }
 

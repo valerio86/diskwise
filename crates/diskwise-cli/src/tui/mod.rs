@@ -56,14 +56,19 @@ fn run_inner(terminal: &mut DefaultTerminal, opts: &Options) -> Result<()> {
             app.live = false;
             from_saved = false;
         }
+        app.start_dupes();
 
         while !app.quit && !app.rescan_requested {
             terminal.draw(|f| ui::draw(f, &app))?;
-            if let Event::Key(key) = event::read()?
+            // While duplicates are being checked, wake up to redraw progress.
+            let ready = !app.dupes_checking() || event::poll(Duration::from_millis(150))?;
+            if ready
+                && let Event::Key(key) = event::read()?
                 && key.kind == KeyEventKind::Press
             {
                 handle_key(&mut app, key);
             }
+            app.poll_dupes();
         }
         if app.quit {
             return Ok(());
@@ -120,20 +125,76 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
     if let Some(modal) = app.modal.take() {
-        if let Modal::ConfirmTrash { targets, .. } = &modal {
-            match key.code {
-                KeyCode::Char('y') | KeyCode::Char('Y') => {
+        let yes = matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y'));
+        let no = matches!(
+            key.code,
+            KeyCode::Char('n') | KeyCode::Esc | KeyCode::Char('q')
+        );
+        match modal {
+            Modal::ConfirmTrash { ref targets, .. } => {
+                if yes {
                     app.status =
                         Some(app.apply_trash(targets, diskwise_core::actions::move_to_trash));
+                } else if no {
+                    app.status = Some("Cancelled.".into())
+                } else {
+                    app.modal = Some(modal); // keep asking
                 }
-                KeyCode::Char('n') | KeyCode::Esc | KeyCode::Char('q') => {
+            }
+            Modal::ConfirmDupes { ref plan, .. } => {
+                if yes {
+                    app.status = Some(app.apply_dupes(plan, diskwise_core::actions::move_to_trash));
+                } else if no {
+                    app.status = Some("Cancelled.".into())
+                } else {
+                    app.modal = Some(modal);
+                }
+            }
+            Modal::PreferFolder {
+                ref prefer,
+                ref over,
+            } => {
+                if yes {
+                    app.remember_folder_order(prefer, over);
+                } else if no {
+                    app.status = Some("Keeping that copy this time only.".into())
+                } else {
+                    app.modal = Some(modal);
+                }
+            }
+            Modal::ChooseFolder { options, selected } => match key.code {
+                KeyCode::Up | KeyCode::Char('k') => {
+                    app.modal = Some(Modal::ChooseFolder {
+                        selected: selected.saturating_sub(1),
+                        options,
+                    })
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    app.modal = Some(Modal::ChooseFolder {
+                        selected: (selected + 1).min(options.len() - 1),
+                        options,
+                    })
+                }
+                KeyCode::Enter => app.mark_intentional(&options[selected]),
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('n') => {
                     app.status = Some("Cancelled.".into())
                 }
-                _ => app.modal = Some(modal), // keep asking
-            }
+                _ => app.modal = Some(Modal::ChooseFolder { options, selected }),
+            },
+            // Any key closes help and messages.
+            Modal::Help | Modal::Message { .. } => {}
         }
-        // Any key closes help and messages.
         return;
+    }
+    if app.tab == app::Tab::Duplicates {
+        match key.code {
+            KeyCode::Left | KeyCode::Char('h') => return app.move_copy(-1),
+            KeyCode::Right | KeyCode::Char('l') => return app.move_copy(1),
+            KeyCode::Char(' ') => return app.cycle_action(),
+            KeyCode::Char('p') => return app.make_keeper(),
+            KeyCode::Char('i') => return app.request_intentional(),
+            _ => {}
+        }
     }
     match key.code {
         KeyCode::Char('q') | KeyCode::Esc => app.quit = true,
@@ -145,9 +206,11 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         KeyCode::End | KeyCode::Char('G') => app.select_last(),
         KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => app.open(),
         KeyCode::Left | KeyCode::Char('h') | KeyCode::Backspace => app.up(),
-        KeyCode::Tab | KeyCode::BackTab => app.toggle_tab(),
+        KeyCode::Tab => app.toggle_tab(),
+        KeyCode::BackTab => app.toggle_tab_back(),
         KeyCode::Char('1') => app.tab = app::Tab::Suggestions,
         KeyCode::Char('2') => app.tab = app::Tab::Browse,
+        KeyCode::Char('3') => app.tab = app::Tab::Duplicates,
         KeyCode::Char('s') => app.cycle_sort(),
         KeyCode::Char('d') | KeyCode::Delete => app.request_trash(),
         KeyCode::Char('r') => app.rescan_requested = true,
