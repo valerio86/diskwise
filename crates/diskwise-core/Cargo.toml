@@ -1,0 +1,12 @@
+[package]
+name = "diskwise-core"
+description = "Disk scanner and macOS storage probes for diskwise"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+plist.workspace = true
+rayon.workspace = true
+serde.workspace = true

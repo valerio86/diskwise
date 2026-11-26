@@ -1,0 +1,238 @@
+use std::collections::HashSet;
+use std::fs::{self, Metadata};
+use std::os::unix::fs::MetadataExt;
+use std::path::Path;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use rayon::prelude::*;
+
+use crate::model::{ErrorSummary, Node, NodeKind};
+
+const MAX_ERROR_SAMPLES: usize = 50;
+
+#[derive(Debug, Clone)]
+pub struct ScanOptions {
+    /// Children smaller than this are folded into a single "rest" node.
+    pub min_node_size: u64,
+    /// Don't descend into other mounted filesystems.
+    pub one_filesystem: bool,
+}
+
+impl Default for ScanOptions {
+    fn default() -> Self {
+        ScanOptions {
+            min_node_size: 10 * 1024 * 1024,
+            one_filesystem: true,
+        }
+    }
+}
+
+struct Ctx {
+    opts: ScanOptions,
+    root_dev: u64,
+    /// (dev, ino) of multiply-linked files already counted.
+    seen_links: Mutex<HashSet<(u64, u64)>>,
+    error_count: AtomicU64,
+    error_samples: Mutex<Vec<String>>,
+}
+
+impl Ctx {
+    fn record_error(&self, path: &Path, err: &std::io::Error) {
+        self.error_count.fetch_add(1, Ordering::Relaxed);
+        let mut samples = self.error_samples.lock().unwrap();
+        if samples.len() < MAX_ERROR_SAMPLES {
+            samples.push(format!("{}: {}", path.display(), err));
+        }
+    }
+
+    /// Allocated bytes for a non-directory entry, counting hard links once.
+    fn allocated_once(&self, meta: &Metadata) -> u64 {
+        let bytes = meta.blocks() * 512;
+        if meta.nlink() > 1
+            && !self
+                .seen_links
+                .lock()
+                .unwrap()
+                .insert((meta.dev(), meta.ino()))
+        {
+            return 0;
+        }
+        bytes
+    }
+}
+
+/// Scan `root` and return its size tree plus a summary of unreadable paths.
+pub fn scan(root: &Path, opts: ScanOptions) -> std::io::Result<(Node, ErrorSummary)> {
+    let meta = fs::symlink_metadata(root)?;
+    let ctx = Ctx {
+        opts,
+        root_dev: meta.dev(),
+        seen_links: Mutex::new(HashSet::new()),
+        error_count: AtomicU64::new(0),
+        error_samples: Mutex::new(Vec::new()),
+    };
+    let tree = scan_dir(root, root.display().to_string(), &meta, &ctx);
+    let errors = ErrorSummary {
+        count: ctx.error_count.load(Ordering::Relaxed),
+        samples: ctx.error_samples.into_inner().unwrap(),
+    };
+    Ok((tree, errors))
+}
+
+fn scan_dir(path: &Path, name: String, meta: &Metadata, ctx: &Ctx) -> Node {
+    let min = ctx.opts.min_node_size;
+    let mut node = Node::new(name, NodeKind::Dir);
+    node.allocated = meta.blocks() * 512;
+    node.newest_mtime = meta.mtime();
+
+    let entries = match fs::read_dir(path) {
+        Ok(e) => e,
+        Err(e) => {
+            ctx.record_error(path, &e);
+            node.incomplete = true;
+            return node;
+        }
+    };
+
+    let mut rest = Node::new(String::new(), NodeKind::Rest);
+    let mut subdirs = Vec::new();
+
+    for entry in entries {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                ctx.record_error(path, &e);
+                node.incomplete = true;
+                continue;
+            }
+        };
+        let child_path = entry.path();
+        let child_meta = match fs::symlink_metadata(&child_path) {
+            Ok(m) => m,
+            Err(e) => {
+                ctx.record_error(&child_path, &e);
+                node.incomplete = true;
+                continue;
+            }
+        };
+        let child_name = entry.file_name().to_string_lossy().into_owned();
+
+        if child_meta.is_dir() {
+            if ctx.opts.one_filesystem && child_meta.dev() != ctx.root_dev {
+                continue; // mount point of another volume
+            }
+            subdirs.push((child_path, child_name, child_meta));
+            continue;
+        }
+
+        // Regular files, symlinks (not followed), sockets, etc.
+        let mut file = Node::new(child_name, NodeKind::File);
+        file.allocated = ctx.allocated_once(&child_meta);
+        file.logical = if child_meta.is_file() {
+            child_meta.len()
+        } else {
+            0
+        };
+        file.files = 1;
+        file.newest_mtime = child_meta.mtime();
+        place(&mut node, &mut rest, file, min);
+    }
+
+    let children: Vec<Node> = subdirs
+        .into_par_iter()
+        .map(|(p, n, m)| scan_dir(&p, n, &m, ctx))
+        .collect();
+    for child in children {
+        node.dirs += 1 + child.dirs;
+        node.incomplete |= child.incomplete;
+        place(&mut node, &mut rest, child, min);
+    }
+
+    // Only list the leftovers alongside bigger siblings; otherwise the directory total says it all.
+    if rest.allocated > 0 && !node.children.is_empty() {
+        rest.name = "(smaller items)".to_string();
+        node.children.push(rest);
+    }
+    node.children
+        .sort_by_key(|c| std::cmp::Reverse(c.allocated));
+    node
+}
+
+/// Add `child`'s totals to `parent`, keeping it as a listed child only if it is big enough.
+fn place(parent: &mut Node, rest: &mut Node, child: Node, min: u64) {
+    parent.allocated += child.allocated;
+    parent.logical += child.logical;
+    parent.files += child.files;
+    parent.newest_mtime = parent.newest_mtime.max(child.newest_mtime);
+    if child.allocated >= min {
+        parent.children.push(child);
+    } else {
+        rest.allocated += child.allocated;
+        rest.logical += child.logical;
+        rest.files += child.files;
+        if child.kind == NodeKind::Dir {
+            rest.dirs += 1 + child.dirs;
+        }
+        rest.newest_mtime = rest.newest_mtime.max(child.newest_mtime);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    fn tmpdir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("diskwise-test-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write(path: &Path, bytes: usize) {
+        let mut f = fs::File::create(path).unwrap();
+        f.write_all(&vec![1u8; bytes]).unwrap();
+    }
+
+    #[test]
+    fn totals_and_folding() {
+        let dir = tmpdir("totals");
+        fs::create_dir(dir.join("big")).unwrap();
+        write(&dir.join("big/a.bin"), 2 * 1024 * 1024);
+        write(&dir.join("small.txt"), 100);
+
+        let opts = ScanOptions {
+            min_node_size: 1024 * 1024,
+            one_filesystem: true,
+        };
+        let (tree, errors) = scan(&dir, opts).unwrap();
+
+        assert_eq!(errors.count, 0);
+        assert_eq!(tree.files, 2);
+        assert_eq!(tree.dirs, 1);
+        assert!(tree.logical == 2 * 1024 * 1024 + 100);
+        assert_eq!(tree.children[0].name, "big");
+        assert_eq!(tree.children[0].children[0].name, "a.bin");
+        let rest = tree
+            .children
+            .iter()
+            .find(|c| c.kind == NodeKind::Rest)
+            .unwrap();
+        assert_eq!(rest.files, 1);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn hard_links_counted_once() {
+        let dir = tmpdir("links");
+        write(&dir.join("one"), 1024 * 1024);
+        fs::hard_link(dir.join("one"), dir.join("two")).unwrap();
+
+        let (tree, _) = scan(&dir, ScanOptions::default()).unwrap();
+        let file_alloc: u64 = fs::symlink_metadata(dir.join("one")).unwrap().blocks() * 512;
+        let dir_alloc: u64 = fs::symlink_metadata(&dir).unwrap().blocks() * 512;
+        assert_eq!(tree.allocated, file_alloc + dir_alloc);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+}
