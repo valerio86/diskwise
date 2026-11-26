@@ -22,6 +22,7 @@ cargo build --release
 ./target/release/diskwise scan --out disk.snapshot.json
 ./target/release/diskwise report disk.snapshot.json
 ./target/release/diskwise suggest                    # scan + cleanup suggestions
+./target/release/diskwise suggest -c                 # one line per suggestion
 ./target/release/diskwise suggest --from disk.snapshot.json --json
 ./target/release/diskwise rules                      # list rules in effect
 ```

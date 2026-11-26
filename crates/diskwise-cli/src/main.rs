@@ -58,6 +58,9 @@ enum Command {
         /// How many paths to list per suggestion.
         #[arg(long, default_value_t = 5)]
         items: usize,
+        /// One line per suggestion.
+        #[arg(short, long, conflicts_with = "json")]
+        compact: bool,
         /// Print findings as JSON.
         #[arg(long)]
         json: bool,
@@ -116,6 +119,7 @@ fn main() -> Result<()> {
             from,
             rules,
             items,
+            compact,
             json,
         } => {
             let ruleset = load_rules(rules.as_deref())?;
@@ -134,6 +138,8 @@ fn main() -> Result<()> {
             let findings = diskwise_core::analyze(&snap, &ruleset, now);
             if json {
                 println!("{}", serde_json::to_string_pretty(&findings)?);
+            } else if compact {
+                print_findings_compact(&findings);
             } else {
                 print_findings(&findings, items);
             }
@@ -173,7 +179,13 @@ fn load_rules(user: Option<&Path>) -> Result<RuleSet> {
 
 const WRAP: usize = 92;
 
-fn print_findings(findings: &[Finding], max_items: usize) {
+const GROUPS: [(Safety, &str); 3] = [
+    (Safety::Safe, "SAFE: nothing is lost"),
+    (Safety::Caution, "CAUTION: safe after a preparatory step"),
+    (Safety::Review, "REVIEW: your data or a judgment call"),
+];
+
+fn print_totals(findings: &[Finding]) {
     let sum = |s: Safety| -> u64 {
         findings
             .iter()
@@ -181,19 +193,70 @@ fn print_findings(findings: &[Finding], max_items: usize) {
             .map(|f| f.bytes)
             .sum()
     };
-    let (safe, caution, review) = (sum(Safety::Safe), sum(Safety::Caution), sum(Safety::Review));
     println!(
         "\nReclaimable: {} safe, {} after a quick step, {} worth reviewing.",
-        human_bytes(safe),
-        human_bytes(caution),
-        human_bytes(review)
+        human_bytes(sum(Safety::Safe)),
+        human_bytes(sum(Safety::Caution)),
+        human_bytes(sum(Safety::Review))
     );
+}
 
-    for (safety, heading) in [
-        (Safety::Safe, "SAFE: nothing is lost"),
-        (Safety::Caution, "CAUTION: safe after a preparatory step"),
-        (Safety::Review, "REVIEW: your data or a judgment call"),
-    ] {
+fn size_label(f: &Finding) -> String {
+    if f.size_known {
+        human_bytes(f.bytes)
+    } else {
+        "size ?".to_string()
+    }
+}
+
+/// One line per finding: size, title, action, and the largest path.
+fn print_findings_compact(findings: &[Finding]) {
+    print_totals(findings);
+    let home = std::env::var("HOME").unwrap_or_default();
+    let tilde = |p: &str| match p.strip_prefix(home.as_str()) {
+        Some(rest) if !home.is_empty() && (rest.is_empty() || rest.starts_with('/')) => {
+            format!("~{rest}")
+        }
+        _ => p.to_string(),
+    };
+    let title_w = findings
+        .iter()
+        .map(|f| f.title.chars().count())
+        .max()
+        .unwrap_or(0);
+    let action_w = findings
+        .iter()
+        .map(|f| f.action.to_string().chars().count())
+        .max()
+        .unwrap_or(0);
+
+    for (safety, heading) in GROUPS {
+        let group: Vec<_> = findings.iter().filter(|f| f.safety == safety).collect();
+        if group.is_empty() {
+            continue;
+        }
+        println!("\n{heading}");
+        for f in group {
+            let location = match f.items.as_slice() {
+                [] => String::new(),
+                [one] => tilde(&one.path),
+                [first, rest @ ..] => format!("{} (+{} more)", tilde(&first.path), rest.len()),
+            };
+            let line = format!(
+                "{:>9}  {:<title_w$}  {:<action_w$}  {location}",
+                size_label(f),
+                f.title,
+                f.action.to_string(),
+            );
+            println!("{}", line.trim_end());
+        }
+    }
+}
+
+fn print_findings(findings: &[Finding], max_items: usize) {
+    print_totals(findings);
+
+    for (safety, heading) in GROUPS {
         let group: Vec<_> = findings.iter().filter(|f| f.safety == safety).collect();
         if group.is_empty() {
             continue;
@@ -203,11 +266,7 @@ fn print_findings(findings: &[Finding], max_items: usize) {
             "─".repeat(WRAP.saturating_sub(heading.len() + 4))
         );
         for f in group {
-            let size = if f.size_known {
-                human_bytes(f.bytes)
-            } else {
-                "size ?".to_string()
-            };
+            let size = size_label(f);
             println!("\n{size:>9}  {}   [{} · {}]", f.title, f.category, f.action);
             print_wrapped("", &f.why);
             print_wrapped("→ ", &f.how);
