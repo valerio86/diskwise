@@ -16,8 +16,8 @@ how to use it; this file covers how to work on it and what's next.
 | 4 | Duplicates, older versions, growth ("correlation" findings) | **in progress**: exact file + folder dupes (core + CLI) done |
 | 5 | Optional local LLM to explain unrecognised folders | planned below |
 
-Two full code reviews have been done and every finding fixed (commits 1ad8f48,
-0b0d063). 74 tests; clippy clean on macOS, Linux and the app.
+Three code reviews have been done and every finding fixed (commits 1ad8f48,
+0b0d063, and the phase 4 review after 083586d). 79 tests; clippy clean on macOS, Linux and the app.
 
 ## Decisions already made (don't relitigate)
 
@@ -171,6 +171,20 @@ needs its own design, since it breaks the "only ever the Trash" model).
   `~/Documents/New FLC` isn't identical (some subfolders were renamed, e.g.
   "Poor craftsmanship - incomplete work" → "…   incomplete work"), so its
   identical subfolders are reported one by one.
+
+### Phase 4 review (2026-11-26): lessons
+
+- `/` as a root: path helpers must treat it as containing everything
+  (`dupes::inside` does; whole-disk scans found no folders before).
+- "Home" means two things: `Protection::is_home` includes service accounts'
+  homes from /etc/passwd (right for *refusing* to trash them);
+  `is_user_home` (home base children + $HOME) is what to *collect* from.
+  Duplicate candidates are also dropped when `Protection::reason` refuses them.
+- The keeper prefers, in order: inside a kept folder, not named as a copy,
+  already sharing storage (else a group of hard links + one independent
+  copy reports 0 freed), then location/age.
+- Storage-sharing probes (FIEMAP forces writeback on Linux) run only on
+  final duplicate groups. Linux: an extent walk cut short counts as shared.
 
 ### 4.2 next: the UIs and acting on duplicates
 

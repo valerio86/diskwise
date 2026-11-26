@@ -66,8 +66,8 @@ pub(super) fn find(
     snap: &Snapshot,
     by_hash: &HashMap<String, Vec<Live>>,
     prefer: Prefer,
+    protection: &Protection,
 ) -> Vec<FolderGroup> {
-    let protection = Protection::for_platform(snap.platform());
     let root = snap.display_root();
     let known: HashMap<&str, &str> = by_hash
         .iter()
@@ -82,7 +82,7 @@ pub(super) fn find(
                     &a.file.path,
                     &b.file.path,
                     &root,
-                    &protection,
+                    protection,
                     &mut candidates,
                 );
             }
@@ -137,6 +137,7 @@ pub(super) fn find(
 
     let home_base = snap.platform().home_base;
     let mut extras: Vec<String> = Vec::new();
+    let mut kept: Vec<String> = Vec::new();
     let mut out = Vec::new();
     for members in groups {
         // A folder inside an extra copy found earlier is already covered.
@@ -170,12 +171,15 @@ pub(super) fn find(
         }
         let first = &summaries[&entries[0].0.path];
         let (size, files) = (first.size, first.files);
-        let copies = rank(entries, prefer, home_base);
+        // A subfolder of a folder that is being kept is the one to keep here too.
+        let keep_first = |p: &str| kept.iter().any(|k| inside(p, k));
+        let copies = rank(entries, prefer, home_base, &keep_first);
         let reclaimable: u64 = copies[1..].iter().map(|c| c.frees).sum();
         if reclaimable == 0 {
             continue;
         }
         extras.extend(copies[1..].iter().map(|c| c.path.clone()));
+        kept.push(copies[0].path.clone());
         out.push(FolderGroup {
             size,
             files,
@@ -485,6 +489,48 @@ mod tests {
         assert!(
             g.copies[0].path.ends_with("/Documents/FLC")
                 || g.copies[0].path.ends_with("/Archive/FLC")
+        );
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn lockstep_works_from_the_root() {
+        let p = Protection::new(&crate::platform::MACOS, vec!["/Users/v".into()]);
+        let mut out = HashSet::new();
+        lockstep("/Users/v/A/x/f", "/Users/v/B/x/f", "/", &p, &mut out);
+        assert!(
+            out.contains(&("/Users/v/A/x".to_string(), "/Users/v/B/x".to_string())),
+            "{out:?}"
+        );
+        assert!(out.contains(&("/Users/v/A".to_string(), "/Users/v/B".to_string())));
+        assert_eq!(out.len(), 2, "stops below the home folder: {out:?}");
+    }
+
+    #[test]
+    fn files_in_a_kept_folder_are_kept() {
+        let d = dir("keptfiles");
+        // An older loose copy with a better claim by age alone…
+        write(&d.join("Misc/a.mov"), &content(1, 2 << 20));
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        // …but Documents/FLC is the folder being kept, so its file wins.
+        project(&d.join("Documents/FLC"), b"n");
+        write(&d.join("Documents/other.txt"), b"only here");
+        project(&d.join("Old/FLC"), b"n");
+        let r = find_dupes(&scan(&d), None, None, Prefer::Original);
+        assert!(
+            r.folders[0].copies[0].path.ends_with("/Documents/FLC"),
+            "{:?}",
+            r.folders
+        );
+        let g = r
+            .groups
+            .iter()
+            .find(|g| g.copies.iter().any(|c| c.path.ends_with("/Misc/a.mov")))
+            .unwrap();
+        assert!(
+            g.copies[0].path.ends_with("/Documents/FLC/photos/a.mov"),
+            "{:?}",
+            g.copies
         );
         std::fs::remove_dir_all(&d).unwrap();
     }

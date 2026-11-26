@@ -98,8 +98,9 @@ enum Command {
     /// clones count as nothing. Nothing is deleted.
     Dupes {
         /// Folder to look in (default: your home folder).
+        #[arg(conflicts_with = "from")]
         path: Option<PathBuf>,
-        /// Use a saved snapshot instead of scanning (made with version 5 or later).
+        /// Use a saved snapshot of this machine instead of scanning.
         #[arg(long)]
         from: Option<PathBuf>,
         /// How many groups to list.
@@ -248,6 +249,12 @@ fn main() -> Result<()> {
             if snap.version < 5 {
                 anyhow::bail!("this snapshot predates duplicate detection; scan again");
             }
+            if snap.platform() != platform::CURRENT {
+                anyhow::bail!(
+                    "this snapshot is from another operating system ({}); duplicates can only be checked on the machine that was scanned",
+                    snap.platform().os
+                );
+            }
             let cache = if no_cache {
                 None
             } else {
@@ -388,7 +395,7 @@ fn print_dupes(r: &diskwise_core::dupes::Report, top: usize) {
     }
     if !r.already_shared.is_empty() {
         println!(
-            "\n{} more groups are already hard links or clones of each other, so deleting copies wouldn't free anything.",
+            "\n{} more groups already share their storage (hard links, clones, or a filesystem snapshot), so deleting copies wouldn't free anything.",
             r.already_shared.len()
         );
     }

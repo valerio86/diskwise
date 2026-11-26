@@ -111,11 +111,12 @@ pub(crate) fn collect_in(
     {
         return false;
     }
-    if protection.is_home(parent) && (name == "Library" || name.starts_with('.')) {
+    if protection.is_user_home(parent) && (name == "Library" || name.starts_with('.')) {
         // App data (~/Library) and tools' own folders (~/.rustup, ~/.local, …).
         return false;
     }
-    parent_collects || protection.is_home(child)
+    // Only people's homes, not service accounts' (/var/lib/postgresql, /var/db/…).
+    parent_collects || protection.is_user_home(child)
 }
 
 /// Keep only files whose size another candidate shares: the rest can't have a duplicate.
@@ -217,7 +218,8 @@ pub struct Report {
     /// Duplicates whose copies already share storage, so deleting frees nothing.
     pub already_shared: Vec<Group>,
     pub candidates: u64,
-    /// Bytes actually read this run (cache hits read nothing).
+    /// Bytes read this run. Cached files still have their first and last 64 KiB
+    /// read (to compare them with uncached ones), never the whole file.
     pub read_bytes: u64,
     /// Candidates skipped because they changed or vanished since the scan.
     pub changed: u64,
@@ -259,12 +261,17 @@ pub fn find(
     }
     let progress = progress.unwrap_or_default();
     let mut cached = cache.map(HashCache::load).unwrap_or_default();
+    let protection = Protection::for_platform(snap.platform());
 
     // Stage 0: still there and unchanged since the scan.
     let live: Vec<Live> = snap
         .large_files
         .par_iter()
         .filter_map(|f| {
+            // Never suggest anything for system or package-manager files.
+            if protection.reason(&f.path).is_some() {
+                return None;
+            }
             let real = PathBuf::from(snap.real_path(&f.path));
             let meta = std::fs::symlink_metadata(&real).ok()?;
             let same = meta.is_file()
@@ -272,9 +279,10 @@ pub fn find(
                 && meta.mtime() == f.mtime
                 && meta.ino() == f.ino
                 && meta.dev() == f.dev;
+            // Storage sharing is looked up later, only for real duplicates.
             same.then(|| Live {
-                private: private_size(&real),
-                can_clone: crate::platform::can_clone(&real),
+                private: None,
+                can_clone: false,
                 file: f.clone(),
                 real,
             })
@@ -299,6 +307,8 @@ pub fn find(
     let hashed: Vec<(String, Live)> = size_groups
         .into_par_iter()
         .flat_map_iter(|group| {
+            let group_bytes: u64 = group.iter().map(|l| l.file.size).sum();
+            let mut done = 0;
             let mut out = Vec::new();
             let mut by_inode: HashMap<(u64, u64), String> = HashMap::new();
             // Head and tail first, for every file: cheap, and it keeps copies with
@@ -328,12 +338,17 @@ pub fn find(
                     progress
                         .done_bytes
                         .fetch_add(l.file.size, Ordering::Relaxed);
+                    done += l.file.size;
                     if let Some(h) = hash {
                         by_inode.insert(key, h.clone());
                         out.push((h, l));
                     }
                 }
             }
+            // Files ruled out by their head and tail are done too.
+            progress
+                .done_bytes
+                .fetch_add(group_bytes - done, Ordering::Relaxed);
             out
         })
         .collect();
@@ -342,15 +357,30 @@ pub fn find(
 
     let mut by_hash: HashMap<String, Vec<Live>> = HashMap::new();
     for (h, l) in hashed {
-        cached.insert(&l.file, &h);
+        cached.insert(&l.file, &l.real, &h);
         by_hash.entry(h).or_default().push(l);
     }
+    by_hash
+        .par_iter_mut()
+        .filter(|(_, ls)| ls.len() > 1)
+        .for_each(|(_, ls)| {
+            for l in ls {
+                l.private = private_size(&l.real);
+                l.can_clone = crate::platform::can_clone(&l.real);
+            }
+        });
     if let Some(path) = cache {
         cached.save(path);
     }
 
-    report.folders = folders::find(snap, &by_hash, prefer);
-    // Files inside an extra folder copy are covered by that folder.
+    report.folders = folders::find(snap, &by_hash, prefer, &protection);
+    // Files inside an extra folder copy are covered by that folder, and files
+    // inside a kept folder are kept (so the two never contradict each other).
+    let kept: Vec<&str> = report
+        .folders
+        .iter()
+        .map(|g| g.copies[0].path.as_str())
+        .collect();
     let extras: Vec<&str> = report
         .folders
         .iter()
@@ -364,7 +394,8 @@ pub fn find(
         if copies.len() < 2 {
             continue;
         }
-        let group = build_group(hash, copies, prefer, snap.platform().home_base);
+        let keep_first = |p: &str| kept.iter().any(|k| inside(p, k));
+        let group = build_group(hash, copies, prefer, snap.platform().home_base, &keep_first);
         if group.reclaimable > 0 {
             report.groups.push(group);
         } else {
@@ -380,9 +411,11 @@ pub fn find(
     report
 }
 
-/// Whether display path `path` is strictly inside folder `dir`.
+/// Whether display path `path` is strictly inside folder `dir` (`/` included).
 fn inside(path: &str, dir: &str) -> bool {
-    path.strip_prefix(dir).is_some_and(|r| r.starts_with('/'))
+    let dir = dir.trim_end_matches('/');
+    path.strip_prefix(dir)
+        .is_some_and(|r| r.starts_with('/') && r.len() > 1)
 }
 
 /// Split `group` by `key`, dropping items without one and subgroups of one.
@@ -399,7 +432,13 @@ where
     m.into_values().filter(|g| g.len() > 1).collect()
 }
 
-fn build_group(hash: String, live: Vec<Live>, prefer: Prefer, home_base: &str) -> Group {
+fn build_group(
+    hash: String,
+    live: Vec<Live>,
+    prefer: Prefer,
+    home_base: &str,
+    keep_first: &dyn Fn(&str) -> bool,
+) -> Group {
     let size = live[0].file.size;
     let copies: Vec<(Copy, u64, bool)> = live
         .into_iter()
@@ -425,7 +464,7 @@ fn build_group(hash: String, live: Vec<Live>, prefer: Prefer, home_base: &str) -
             (copy, l.file.dev, l.can_clone)
         })
         .collect();
-    let copies = rank(copies, prefer, home_base);
+    let copies = rank(copies, prefer, home_base, keep_first);
     // Other names of a hard-linked file already count as freeing nothing (and
     // deleting every name of one would free it once: underestimated, never over).
     let reclaimable = copies[1..].iter().map(|c| c.frees).sum();
@@ -439,7 +478,17 @@ fn build_group(hash: String, live: Vec<Live>, prefer: Prefer, home_base: &str) -
 
 /// Order copies (keeper first) and set each extra copy's action. Each entry is
 /// (copy, device, whether its filesystem can clone). Shared by files and folders.
-fn rank(mut copies: Vec<(Copy, u64, bool)>, prefer: Prefer, home_base: &str) -> Vec<Copy> {
+///
+/// Keeper preference, strongest first: inside a folder that is itself being
+/// kept (`keep_first`); not named as a copy of another one; already sharing
+/// storage (keeping a hard link or clone and dropping the independent copy
+/// frees space, the other way round frees nothing); then `keep_order`.
+fn rank(
+    mut copies: Vec<(Copy, u64, bool)>,
+    prefer: Prefer,
+    home_base: &str,
+    keep_first: &dyn Fn(&str) -> bool,
+) -> Vec<Copy> {
     // A copy named like another one plus a marker ("a-1" next to "a") is never
     // the keeper while the plain name is there.
     let marked: HashSet<String> = copies
@@ -451,10 +500,12 @@ fn rank(mut copies: Vec<(Copy, u64, bool)>, prefer: Prefer, home_base: &str) -> 
         })
         .map(|(c, _, _)| c.path.clone())
         .collect();
+    let shared = |c: &Copy| c.shared.is_some();
     copies.sort_by(|a, b| {
-        marked
-            .contains(&a.0.path)
-            .cmp(&marked.contains(&b.0.path))
+        keep_first(&b.0.path)
+            .cmp(&keep_first(&a.0.path))
+            .then_with(|| marked.contains(&a.0.path).cmp(&marked.contains(&b.0.path)))
+            .then_with(|| shared(&b.0).cmp(&shared(&a.0)))
             .then_with(|| keep_order(&a.0, &b.0, prefer))
     });
     let (keeper, keeper_dev, _) = &copies[0];
@@ -640,7 +691,17 @@ struct CacheEntry {
     mtime: i64,
     ino: u64,
     hash: String,
+    /// On-disk path (the key is the display path, which may differ on macOS).
+    #[serde(default)]
+    real: String,
+    /// When this entry was last used or confirmed, Unix seconds.
+    #[serde(default)]
+    seen: i64,
 }
+
+/// Entries that can't be checked (e.g. on a drive that isn't plugged in) are
+/// kept this long after they were last seen.
+const UNCHECKED_TTL: i64 = 180 * 86_400;
 
 const CACHE_VERSION: u32 = 1;
 
@@ -658,7 +719,7 @@ impl HashCache {
         (e.size == f.size && e.mtime == f.mtime && e.ino == f.ino).then_some(e.hash.as_str())
     }
 
-    fn insert(&mut self, f: &LargeFile, hash: &str) {
+    fn insert(&mut self, f: &LargeFile, real: &Path, hash: &str) {
         self.used.insert(f.path.clone());
         self.entries.insert(
             f.path.clone(),
@@ -667,18 +728,31 @@ impl HashCache {
                 mtime: f.mtime,
                 ino: f.ino,
                 hash: hash.to_string(),
+                real: real.display().to_string(),
+                seen: now(),
             },
         );
     }
 
-    /// Write the cache, keeping entries from this run and older ones whose
-    /// file still looks the same (so scanning one folder doesn't forget another).
+    /// Write the cache, keeping entries from this run, older ones whose file
+    /// still looks the same (so scanning one folder doesn't forget another),
+    /// and for a while ones that can't be checked because their folder is gone
+    /// (an unplugged drive). Entries whose folder is there but file isn't go.
     fn save(mut self, path: &Path) {
         let used = std::mem::take(&mut self.used);
+        let now = now();
         self.entries.retain(|p, e| {
-            used.contains(p)
-                || std::fs::symlink_metadata(p)
-                    .is_ok_and(|m| m.len() == e.size && m.mtime() == e.mtime && m.ino() == e.ino)
+            if used.contains(p) {
+                return true;
+            }
+            let real = Path::new(if e.real.is_empty() { p } else { &e.real });
+            match std::fs::symlink_metadata(real) {
+                Ok(m) => m.len() == e.size && m.mtime() == e.mtime && m.ino() == e.ino,
+                Err(_) => {
+                    let folder_gone = real.parent().is_some_and(|d| !d.exists());
+                    folder_gone && now - e.seen < UNCHECKED_TTL
+                }
+            }
         });
         self.version = CACHE_VERSION;
         if let Some(dir) = path.parent() {
@@ -692,6 +766,12 @@ impl HashCache {
             let _ = std::fs::rename(&tmp, path);
         }
     }
+}
+
+fn now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64)
 }
 
 /// Where the hash cache lives by default.
@@ -1051,6 +1131,7 @@ mod tests {
             ],
             Prefer::Original,
             "/Users",
+            &|_| false,
         );
         assert_eq!(g.copies[0].path, "/Users/v/Documents/FLC/IMG_1.MOV");
         let action = |p: &str| g.copies.iter().find(|c| c.path == p).unwrap().action;
@@ -1072,8 +1153,68 @@ mod tests {
             ],
             Prefer::Original,
             "/Users",
+            &|_| false,
         );
         assert_eq!(g.copies[1].action, Some(Action::StoreOnce));
+    }
+
+    #[test]
+    fn keeper_prefers_shared_storage() {
+        // A1 and A2 are hard links of one file; B is an older independent copy.
+        // Keeping B would free nothing (A1, A2 are each other's storage);
+        // keeping A1 frees B.
+        let mk = |path: &str, ino: u64, nlink: u64, created: i64| Live {
+            file: LargeFile {
+                path: path.into(),
+                size: 10,
+                allocated: 4096,
+                mtime: created,
+                created,
+                dev: 1,
+                ino,
+                nlink,
+            },
+            real: PathBuf::from(path),
+            private: Some(4096),
+            can_clone: true,
+        };
+        let g = build_group(
+            "h".into(),
+            vec![
+                mk("/Users/v/A1/x", 7, 2, 200),
+                mk("/Users/v/A2/x", 7, 2, 200),
+                mk("/Users/v/B/x", 8, 1, 100),
+            ],
+            Prefer::Original,
+            "/Users",
+            &|_| false,
+        );
+        assert_ne!(g.copies[0].path, "/Users/v/B/x", "{:?}", g.copies);
+        assert_eq!(g.reclaimable, 4096);
+    }
+
+    #[test]
+    fn service_homes_are_not_collected() {
+        let p = Protection::new(&LINUX, vec!["/var/lib/postgresql".into(), "/home/v".into()]);
+        assert!(!collect_in(
+            false,
+            "/var/lib",
+            "postgresql",
+            "/var/lib/postgresql",
+            &p
+        ));
+        assert!(collect_in(false, "/home", "v", "/home/v", &p));
+        assert!(collect_in(false, "/home", "w", "/home/w", &p));
+    }
+
+    #[test]
+    fn inside_handles_root() {
+        assert!(inside("/Users/v/A", "/"));
+        assert!(inside("/Users/v/A", "/Users"));
+        assert!(inside("/Users/v/A", "/Users/"));
+        assert!(!inside("/Users", "/Users"));
+        assert!(!inside("/Usersx/a", "/Users"));
+        assert!(!inside("/", "/"));
     }
 
     #[test]

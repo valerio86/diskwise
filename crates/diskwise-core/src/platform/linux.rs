@@ -97,6 +97,7 @@ pub(crate) fn private_size(path: &Path) -> Option<u64> {
     let allocated = file.metadata().ok()?.blocks() * 512;
     let mut start = 0u64;
     // Bounded: a pathological file with millions of extents isn't worth walking.
+    // Not knowing then counts as shared, so the estimate stays low.
     for _ in 0..1024 {
         let mut map: Fiemap = unsafe { std::mem::zeroed() };
         map.start = start;
@@ -122,7 +123,7 @@ pub(crate) fn private_size(path: &Path) -> Option<u64> {
         let last = map.extents[n.min(BATCH) - 1];
         start = last.logical + last.length;
     }
-    None
+    Some(0)
 }
 
 /// Where diskwise keeps caches: $XDG_CACHE_HOME/diskwise or ~/.cache/diskwise.
@@ -138,8 +139,8 @@ pub(crate) fn cache_dir() -> Option<std::path::PathBuf> {
 /// XFS can be formatted without reflink support; acting on a clone checks again.
 pub(crate) fn can_clone(path: &Path) -> bool {
     use std::os::unix::ffi::OsStrExt;
-    const BTRFS_SUPER_MAGIC: i64 = 0x9123_683E;
-    const XFS_SUPER_MAGIC: i64 = 0x5846_5342;
+    const BTRFS_SUPER_MAGIC: u32 = 0x9123_683E;
+    const XFS_SUPER_MAGIC: u32 = 0x5846_5342;
     let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
         return false;
     };
@@ -147,5 +148,6 @@ pub(crate) fn can_clone(path: &Path) -> bool {
     if unsafe { libc::statfs(c_path.as_ptr(), &mut st) } != 0 {
         return false;
     }
-    matches!(st.f_type as i64, BTRFS_SUPER_MAGIC | XFS_SUPER_MAGIC)
+    // f_type is signed and its width varies by architecture; the magic numbers are 32-bit.
+    matches!(st.f_type as u32, BTRFS_SUPER_MAGIC | XFS_SUPER_MAGIC)
 }

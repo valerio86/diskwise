@@ -140,6 +140,8 @@ pub struct Protection {
     home_bases: Vec<String>,
     /// Home folders themselves, wherever they live ($HOME, the user database).
     homes: Vec<String>,
+    /// $HOME (and where it really is): a person's home even outside `home_bases`.
+    own_home: Vec<String>,
     system: &'static [&'static str],
 }
 
@@ -151,6 +153,12 @@ impl Protection {
         if platform == crate::platform::CURRENT {
             if let Some(base) = canonical(platform.home_base) {
                 p.home_bases.push(base);
+            }
+            if let Ok(h) = std::env::var("HOME")
+                && h.len() > 1
+            {
+                p.own_home.push(h.trim_end_matches('/').to_string());
+                p.own_home.extend(canonical(&h));
             }
             let mut homes: Vec<String> = std::env::var("HOME").ok().into_iter().collect();
             if let Ok(passwd) = std::fs::read_to_string("/etc/passwd") {
@@ -172,6 +180,7 @@ impl Protection {
         Protection {
             home_bases: vec![platform.home_base.to_string()],
             homes,
+            own_home: Vec::new(),
             system: if platform.os == "macos" {
                 MACOS_SYSTEM
             } else {
@@ -215,6 +224,18 @@ impl Protection {
             .and_then(|p| p.to_str())
             .unwrap_or("");
         self.homes.iter().any(|h| h == path) || self.home_bases.iter().any(|b| b == parent)
+    }
+
+    /// Whether `path` is a person's home folder: one under the home base
+    /// (/Users/x, /home/x) or $HOME. Unlike `is_home`, not service accounts'
+    /// homes from the user database (/var/lib/postgresql, /var/db/…).
+    pub fn is_user_home(&self, path: &str) -> bool {
+        let path = path.trim_end_matches('/');
+        let parent = Path::new(path)
+            .parent()
+            .and_then(|p| p.to_str())
+            .unwrap_or("");
+        self.own_home.iter().any(|h| h == path) || self.home_bases.iter().any(|b| b == parent)
     }
 
     /// Whether `path` is, or contains, the folder home folders live in.
