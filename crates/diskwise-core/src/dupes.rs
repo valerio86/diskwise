@@ -48,6 +48,10 @@ const OWNED_DIRS: &[&str] = &[
     ".Trashes",
     ".cache",
     "Caches",
+    // The TV and Music apps' media folders (~/Movies/TV/Media.localized,
+    // ~/Music/Music/Media.localized, older ~/Music/iTunes/iTunes Media).
+    "Media.localized",
+    "iTunes Media",
 ];
 
 /// Package folders (they look like single files in Finder) and app libraries.
@@ -341,7 +345,7 @@ pub fn find(
         if copies.len() < 2 {
             continue;
         }
-        let group = build_group(hash, copies, prefer);
+        let group = build_group(hash, copies, prefer, snap.platform().home_base);
         if group.reclaimable > 0 {
             report.groups.push(group);
         } else {
@@ -371,7 +375,7 @@ where
     m.into_values().filter(|g| g.len() > 1).collect()
 }
 
-fn build_group(hash: String, live: Vec<Live>, prefer: Prefer) -> Group {
+fn build_group(hash: String, live: Vec<Live>, prefer: Prefer, home_base: &str) -> Group {
     let size = live[0].file.size;
     let mut copies: Vec<(Copy, u64, bool)> = live
         .into_iter()
@@ -397,13 +401,34 @@ fn build_group(hash: String, live: Vec<Live>, prefer: Prefer) -> Group {
             (copy, l.file.dev, l.can_clone)
         })
         .collect();
-    copies.sort_by(|a, b| keep_order(&a.0, &b.0, prefer));
+    // A copy named like another one plus a marker ("a-1" next to "a") is never
+    // the keeper while the plain name is there.
+    let marked: HashSet<String> = copies
+        .iter()
+        .filter(|(c, _, _)| {
+            copies
+                .iter()
+                .any(|(o, _, _)| is_named_copy(&o.path, &c.path))
+        })
+        .map(|(c, _, _)| c.path.clone())
+        .collect();
+    copies.sort_by(|a, b| {
+        marked
+            .contains(&a.0.path)
+            .cmp(&marked.contains(&b.0.path))
+            .then_with(|| keep_order(&a.0, &b.0, prefer))
+    });
     let (keeper, keeper_dev, _) = &copies[0];
     let (keeper_path, keeper_dev) = (keeper.path.clone(), *keeper_dev);
+    let keeper_in_downloads = in_downloads(&keeper_path, home_base);
     for (c, dev, can_clone) in &mut copies[1..] {
         c.action = Some(if c.frees == 0 {
             Action::Nothing
-        } else if is_named_copy(&keeper_path, &c.path) {
+        } else if is_named_copy(&keeper_path, &c.path)
+            || (in_downloads(&c.path, home_base) && !keeper_in_downloads)
+        {
+            // A second copy next to the original, or a download that was
+            // since filed somewhere else (apps rarely use files in Downloads).
             Action::Trash
         } else if *dev == keeper_dev && *can_clone {
             Action::StoreOnce
@@ -465,6 +490,22 @@ fn copy_penalty(path: &str) -> u32 {
         }
     }
     p
+}
+
+/// Whether `path` is inside someone's Downloads folder (`<home_base>/<user>/Downloads/…`,
+/// or `$HOME/Downloads/…` for a home folder that lives elsewhere).
+fn in_downloads(path: &str, home_base: &str) -> bool {
+    let under = |home: &str| {
+        path.strip_prefix(home)
+            .and_then(|r| r.strip_prefix("/Downloads/"))
+            .is_some()
+    };
+    let by_base = path
+        .strip_prefix(home_base)
+        .and_then(|r| r.strip_prefix('/'))
+        .and_then(|r| r.split_once('/'))
+        .is_some_and(|(_, rest)| rest.starts_with("Downloads/"));
+    by_base || std::env::var("HOME").is_ok_and(|h| under(h.trim_end_matches('/')))
 }
 
 /// Whether `copy` is in the same folder as `keeper` and named like it plus a copy
@@ -823,6 +864,20 @@ mod tests {
             "/Users/v/Code/x/.git",
             &p
         ));
+        assert!(!collect_in(
+            true,
+            "/Users/v/Movies/TV",
+            "Media.localized",
+            "/Users/v/Movies/TV/Media.localized",
+            &p
+        ));
+        assert!(!collect_in(
+            true,
+            "/Users/v/Music/iTunes",
+            "iTunes Media",
+            "/Users/v/Music/iTunes/iTunes Media",
+            &p
+        ));
         let l = Protection::new(&LINUX, vec![]);
         assert!(collect_at_root("/srv/share", &l));
         assert!(!collect_at_root("/", &l));
@@ -900,6 +955,95 @@ mod tests {
             assert!(keeper.ends_with("/Projects/survey/a.jpg"), "{keeper}");
         }
         std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn downloads_and_marked_names() {
+        let d = dir("downloads");
+        // The scan root stands in for a home folder: put a Downloads inside a
+        // fake <home_base>/<user> so the path test applies.
+        let a = content(8, 2 << 20);
+        write(&d.join("Documents/report.pdf"), &a);
+        write(&d.join("Downloads/report.pdf"), &a);
+        let b = content(9, 2 << 20);
+        write(&d.join("Movies/clip2.mp4"), &b);
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        // Newer, but named as a copy of the other: never the keeper.
+        write(&d.join("Movies/clip2-1.mp4"), &b);
+        let snap = scan(&d);
+        let r = find(&snap, None, None, Prefer::NewestCopy);
+        let clip = r
+            .groups
+            .iter()
+            .find(|g| g.copies[0].path.contains("clip"))
+            .unwrap();
+        assert!(
+            clip.copies[0].path.ends_with("/clip2.mp4"),
+            "{:?}",
+            clip.copies
+        );
+        assert_eq!(clip.copies[1].action, Some(Action::Trash));
+        std::fs::remove_dir_all(&d).unwrap();
+
+        assert!(in_downloads("/Users/v/Downloads/a.pdf", "/Users"));
+        assert!(in_downloads("/Users/v/Downloads/sub/a.pdf", "/Users"));
+        assert!(!in_downloads(
+            "/Users/v/Documents/Downloads/a.pdf",
+            "/Users"
+        ));
+        assert!(!in_downloads("/Users/v/Downloads", "/Users"));
+        assert!(!in_downloads("/srv/Downloads/a.pdf", "/home"));
+    }
+
+    #[test]
+    fn downloads_copy_is_trash() {
+        let mk = |path: &str| Live {
+            file: LargeFile {
+                path: path.into(),
+                size: 10,
+                allocated: 4096,
+                mtime: 1,
+                created: 1,
+                dev: 1,
+                ino: path.len() as u64,
+                nlink: 1,
+            },
+            real: PathBuf::from(path),
+            private: Some(4096),
+            can_clone: true,
+        };
+        let g = build_group(
+            "h".into(),
+            vec![
+                mk("/Users/v/Downloads/Photos-001 (5)/IMG_1.MOV"),
+                mk("/Users/v/Documents/FLC/IMG_1.MOV"),
+                mk("/Users/v/Development/site/web/IMG_1.MOV"),
+            ],
+            Prefer::Original,
+            "/Users",
+        );
+        assert_eq!(g.copies[0].path, "/Users/v/Documents/FLC/IMG_1.MOV");
+        let action = |p: &str| g.copies.iter().find(|c| c.path == p).unwrap().action;
+        assert_eq!(
+            action("/Users/v/Downloads/Photos-001 (5)/IMG_1.MOV"),
+            Some(Action::Trash)
+        );
+        assert_eq!(
+            action("/Users/v/Development/site/web/IMG_1.MOV"),
+            Some(Action::StoreOnce)
+        );
+
+        // Both in Downloads: nothing says which is the stray.
+        let g = build_group(
+            "h".into(),
+            vec![
+                mk("/Users/v/Downloads/a/x.MOV"),
+                mk("/Users/v/Downloads/b/x.MOV"),
+            ],
+            Prefer::Original,
+            "/Users",
+        );
+        assert_eq!(g.copies[1].action, Some(Action::StoreOnce));
     }
 
     #[test]

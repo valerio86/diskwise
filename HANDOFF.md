@@ -17,7 +17,7 @@ how to use it; this file covers how to work on it and what's next.
 | 5 | Optional local LLM to explain unrecognised folders | planned below |
 
 Two full code reviews have been done and every finding fixed (commits 1ad8f48,
-0b0d063). 68 tests; clippy clean on macOS, Linux and the app.
+0b0d063). 70 tests; clippy clean on macOS, Linux and the app.
 
 ## Decisions already made (don't relitigate)
 
@@ -113,7 +113,8 @@ needs its own design, since it breaks the "only ever the Trash" model).
   people's own places are collected: inside home folders when the root contains
   them (`/`, `/Users`), or anywhere under a root that doesn't (`/srv`, an
   external drive). Never ~/Library, home dot-folders, `.git`/`node_modules`/
-  caches, or packages (`.app`, `.photoslibrary`, `.lrdata`, …): deleting one
+  caches, the TV/Music media folders (`Media.localized`, `iTunes Media`), or
+  packages (`.app`, `.photoslibrary`, `.lrdata`, …): deleting one
   "duplicate" there breaks the owner. Only files whose size another candidate
   shares are kept (home: ~1.3k entries).
 - **`dupes::find`**: checks that each file is unchanged since the scan, groups
@@ -131,19 +132,23 @@ needs its own design, since it breaks the "only ever the Trash" model).
   (`LargeFile::created`; Finder copies keep the original's mtime, so mtime
   can't tell them apart) per `Prefer::Original` (default) or
   `Prefer::NewestCopy`, then shortest path. First copy in `Group::copies` is
-  the keeper. The automatic pick is only a default: the user must be able to
-  override it (see 4.2).
+  the keeper. A copy named like another copy plus a marker (`a-1` next to `a`)
+  is never the keeper while the plain name exists. The automatic pick is only a
+  default: the user must be able to override it (see 4.2).
 - **A suggested action per extra copy** (`Copy::action`), decided with the user:
-  - `Trash`: a clear stray copy. Same folder as the keeper, with the keeper's
-    name plus a copy marker (`copy`, `copy 2`, `(1)`, `_1`, `-2`, `Copy of …`).
-    Judged *relative to the keeper*, so `IMG_1.jpg` alone never counts.
+  - `Trash`: a clear stray copy. Either same folder as the keeper, with the
+    keeper's name plus a copy marker (`copy`, `copy 2`, `(1)`, `_1`, `-2`,
+    `Copy of …`; judged *relative to the keeper*, so `IMG_1.jpg` alone never
+    counts), or **in `~/Downloads` while the keeper is elsewhere** (downloaded,
+    then filed; apps rarely use files in Downloads; user agreed 2026-11-26
+    after reviewing real examples). Both copies in Downloads stays in doubt.
   - `StoreOnce`: in doubt (same contents elsewhere; something may refer to that
     path). Replace it with a clone of the keeper, so both paths keep working and
     the contents are stored once. Only on the keeper's volume, and only where
     clones work (`platform::can_clone`: APFS; btrfs/XFS).
   - `Review`: in doubt, but a clone isn't possible: Trash only, the user's call.
   - `Nothing`: already shares storage with the keeper.
-  - On the user's home: 20 copies (145 MB) Trash, 499 (2.3 GB) StoreOnce.
+  - On the user's home: 170 copies (1.0 GB) Trash, 347 (1.4 GB) StoreOnce.
 - **`diskwise dupes [PATH]`** (default `$HOME`; `--from`, `--top`, `--json`,
   `--no-cache`, `--prefer original|newest`). On the user's home: 2.4 GB in 394 groups, ~5 s; reruns use the
   cache for hashing (the scan dominates).
@@ -164,6 +169,29 @@ needs its own design, since it breaks the "only ever the Trash" model).
   preferences file and applied to every group with that pair of folders (copies
   come in batches); (3) the `Prefer` setting (original / newest copy). After a
   swap, actions are recomputed against the new keeper.
+- **Every extra copy offers every action that applies**; the suggested one is
+  only preselected (the user wants to keep some suggested-Trash copies, e.g. in
+  stilson-road). Actions: Move to Trash; Store once (same volume + clones);
+  **Keep as is**, remembered either for that file ("these copies are meant to
+  exist", keyed by content hash + paths) or for a whole folder ("duplicates in
+  `~/Development/stilson-road` are intentional": never suggest Trash there,
+  offer Store once or nothing). Saved in the same preferences file as the
+  folder-pair keeper choices, and respected by later scans.
+- **No symlink action** (decided): Store once gives the same result without
+  breaking when the keeper moves, without edits leaking between copies, and
+  without tools (git, zip, web servers) treating the path differently. A
+  cross-volume link is the only thing it can't do, and that breaks whenever
+  the drive is unplugged. Revisit only if a real case comes up.
+- **Synced folders** (Dropbox, Google Drive, OneDrive, iCloud Drive, Nextcloud,
+  Syncthing): deleting a copy there deletes it in the cloud and on every
+  device, and replacing it with a clone may re-upload it. Copies inside one
+  should never be preselected for Trash or Store once (Review, with that
+  warning). Detect by marker files (`.dropbox`, `.stfolder`, `.sync`,
+  `.owncloudsync.log`, `.sync_*.db`), not by folder names: the user's
+  `~/google-drive` is a plain old folder. Modern Google Drive/Dropbox/OneDrive
+  and iCloud Drive live under ~/Library (CloudStorage, Mobile Documents),
+  which is never collected. iCloud "Desktop & Documents" syncing would make
+  ~/Desktop and ~/Documents synced: check how to detect it.
 - **"Store once" action**: on the copy's volume, clone the keeper next to the
   copy (`clonefile` on macOS, `FICLONE` on Linux), carry over the copy's own
   metadata (permissions, owner, Finder tags and other xattrs, creation and
