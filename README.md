@@ -9,7 +9,7 @@ reclaim it.
 | Phase | What | State |
 |---|---|---|
 | 1 | Scanner CLI + JSON snapshot + macOS probes (APFS volumes, snapshots, swap) | ✅ |
-| 2 | Rules engine: recognise caches, regenerable data, app-managed data, user data | ⏳ |
+| 2 | Rules engine + `suggest`: caches, regenerable data, app-managed data, your data, system space | ✅ |
 | 3 | Tauri UI: treemap, suggestions list, move-to-Trash actions with verification | ⏳ |
 | 4 | Optional local LLM to explain unrecognised folders | ⏳ |
 
@@ -21,6 +21,9 @@ cargo build --release
 ./target/release/diskwise scan ~/Library -d 3 -t 10  # one folder, deeper
 ./target/release/diskwise scan --out disk.snapshot.json
 ./target/release/diskwise report disk.snapshot.json
+./target/release/diskwise suggest                    # scan + cleanup suggestions
+./target/release/diskwise suggest --from disk.snapshot.json --json
+./target/release/diskwise rules                      # list rules in effect
 ```
 
 For a complete scan, give your terminal **Full Disk Access**
@@ -40,8 +43,31 @@ folders are reported as unreadable rather than silently skipped.
 
 Known limitation: APFS clones (copy-on-write copies) are counted at full size.
 
+## Suggestions
+
+`diskwise suggest` groups what it finds by how safe it is to act on:
+
+- **safe**: nothing is lost (caches, logs, installers you can download again)
+- **caution**: safe after a preparatory step (quit the app first, check the project)
+- **review**: your data or a judgment call, plus explanations of space you can't
+  simply delete (Preboot, snapshots, the gap a file walk can't see)
+
+Each suggestion says what the item is, how to clear it, and, where it matters,
+how to stop it coming back (e.g. Chrome re-downloads its AI model unless a policy is set).
+
+### Rules
+
+Rules live in [`crates/diskwise-core/rules/default.toml`](crates/diskwise-core/rules/default.toml)
+and are compiled into the binary. A rule matches absolute paths with globs (`~/`
+= every home folder) plus optional conditions: `kind`, `min_size`,
+`older_than_days`, `sibling` (e.g. only `target/` next to a `Cargo.toml`). The
+first matching rule claims a path, so specific rules come before generic ones.
+
+Add your own with `--rules my-rules.toml`: they take priority, and a rule with
+the same `id` as a built-in one replaces it.
+
 ## Layout
 
-- `crates/diskwise-core` — scanner, snapshot model, system probes (library; the
-  Tauri app will reuse it)
+- `crates/diskwise-core` — scanner, snapshot model, system probes, rules and
+  analysis (library; the Tauri app will reuse it)
 - `crates/diskwise-cli` — `diskwise` command-line tool

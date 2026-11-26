@@ -1,9 +1,13 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use diskwise_core::{DEFAULT_ROOT, Node, NodeKind, ScanOptions, Snapshot, human_bytes, parse_size};
+use diskwise_core::rules::{BUILTIN_RULES, Safety};
+use diskwise_core::{
+    DEFAULT_ROOT, Finding, Node, NodeKind, RuleSet, ScanOptions, Snapshot, human_bytes, parse_size,
+};
 
 #[derive(Parser)]
 #[command(name = "diskwise", version, about = "See where your disk space went")]
@@ -39,6 +43,30 @@ enum Command {
         file: PathBuf,
         #[command(flatten)]
         view: ViewArgs,
+    },
+    /// Scan (or load a snapshot) and suggest what to clean up.
+    Suggest {
+        /// Directory to scan.
+        #[arg(default_value = DEFAULT_ROOT)]
+        path: PathBuf,
+        /// Analyse a saved snapshot instead of scanning.
+        #[arg(long)]
+        from: Option<PathBuf>,
+        /// Your own rules file (TOML); its rules take priority over the built-in ones.
+        #[arg(long)]
+        rules: Option<PathBuf>,
+        /// How many paths to list per suggestion.
+        #[arg(long, default_value_t = 5)]
+        items: usize,
+        /// Print findings as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// List the rules in effect.
+    Rules {
+        /// Your own rules file (TOML), listed first.
+        #[arg(long)]
+        rules: Option<PathBuf>,
     },
 }
 
@@ -81,12 +109,144 @@ fn main() -> Result<()> {
             print_report(&snap, &view);
         }
         Command::Report { file, view } => {
-            let bytes = fs::read(&file).with_context(|| format!("reading {}", file.display()))?;
-            let snap: Snapshot = serde_json::from_slice(&bytes).context("parsing snapshot")?;
-            print_report(&snap, &view);
+            print_report(&load_snapshot(&file)?, &view);
+        }
+        Command::Suggest {
+            path,
+            from,
+            rules,
+            items,
+            json,
+        } => {
+            let ruleset = load_rules(rules.as_deref())?;
+            let snap = match from {
+                Some(file) => load_snapshot(&file)?,
+                None => {
+                    eprintln!("Scanning {} …", path.display());
+                    diskwise_core::snapshot(&path, ScanOptions::default(), true)
+                        .with_context(|| format!("scanning {}", path.display()))?
+                }
+            };
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            let findings = diskwise_core::analyze(&snap, &ruleset, now);
+            if json {
+                println!("{}", serde_json::to_string_pretty(&findings)?);
+            } else {
+                print_findings(&findings, items);
+            }
+        }
+        Command::Rules { rules } => {
+            for r in load_rules(rules.as_deref())?.rules() {
+                let d = &r.def;
+                println!(
+                    "{:<28} {:<8} {:<11} {}",
+                    d.id, d.safety, d.category, d.title
+                );
+            }
         }
     }
     Ok(())
+}
+
+fn load_snapshot(file: &Path) -> Result<Snapshot> {
+    let bytes = fs::read(file).with_context(|| format!("reading {}", file.display()))?;
+    serde_json::from_slice(&bytes).context("parsing snapshot")
+}
+
+/// Built-in rules, with the user's file (if any) taking priority.
+fn load_rules(user: Option<&Path>) -> Result<RuleSet> {
+    match user {
+        None => RuleSet::builtin(),
+        Some(p) => {
+            let text = fs::read_to_string(p).with_context(|| format!("reading {}", p.display()))?;
+            let name = p.display().to_string();
+            RuleSet::from_sources(&[
+                (name.as_str(), text.as_str()),
+                ("built-in rules", BUILTIN_RULES),
+            ])
+        }
+    }
+}
+
+const WRAP: usize = 92;
+
+fn print_findings(findings: &[Finding], max_items: usize) {
+    let sum = |s: Safety| -> u64 {
+        findings
+            .iter()
+            .filter(|f| f.safety == s && f.reclaimable())
+            .map(|f| f.bytes)
+            .sum()
+    };
+    let (safe, caution, review) = (sum(Safety::Safe), sum(Safety::Caution), sum(Safety::Review));
+    println!(
+        "\nReclaimable: {} safe, {} after a quick step, {} worth reviewing.",
+        human_bytes(safe),
+        human_bytes(caution),
+        human_bytes(review)
+    );
+
+    for (safety, heading) in [
+        (Safety::Safe, "SAFE: nothing is lost"),
+        (Safety::Caution, "CAUTION: safe after a preparatory step"),
+        (Safety::Review, "REVIEW: your data or a judgment call"),
+    ] {
+        let group: Vec<_> = findings.iter().filter(|f| f.safety == safety).collect();
+        if group.is_empty() {
+            continue;
+        }
+        println!(
+            "\n── {heading} {}",
+            "─".repeat(WRAP.saturating_sub(heading.len() + 4))
+        );
+        for f in group {
+            let size = if f.size_known {
+                human_bytes(f.bytes)
+            } else {
+                "size ?".to_string()
+            };
+            println!("\n{size:>9}  {}   [{} · {}]", f.title, f.category, f.action);
+            print_wrapped("", &f.why);
+            print_wrapped("→ ", &f.how);
+            if let Some(p) = &f.prevent {
+                print_wrapped("Prevent: ", p);
+            }
+            for item in f.items.iter().take(max_items) {
+                println!("           {:>9}  {}", human_bytes(item.bytes), item.path);
+            }
+            if f.items.len() > max_items {
+                let rest: u64 = f.items[max_items..].iter().map(|i| i.bytes).sum();
+                println!(
+                    "           {:>9}  … and {} more",
+                    human_bytes(rest),
+                    f.items.len() - max_items
+                );
+            }
+        }
+    }
+}
+
+/// Print `text` word-wrapped under the finding title, with `lead` on the first line.
+fn print_wrapped(lead: &str, text: &str) {
+    let indent = " ".repeat(11);
+    let mut line = format!("{indent}{lead}");
+    let mut empty = true;
+    for word in text.split_whitespace() {
+        if !empty && line.chars().count() + 1 + word.chars().count() > WRAP {
+            println!("{line}");
+            line = format!("{indent}{}", " ".repeat(lead.chars().count()));
+            empty = true;
+        }
+        if !empty {
+            line.push(' ');
+        }
+        line.push_str(word);
+        empty = false;
+    }
+    println!("{line}");
 }
 
 fn print_report(snap: &Snapshot, view: &ViewArgs) {

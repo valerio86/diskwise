@@ -1,14 +1,18 @@
 //! diskwise core: scan a disk into a size tree and collect macOS storage facts.
 
 pub mod model;
+pub mod rules;
 pub mod scan;
+pub mod suggest;
 pub mod system;
 
 use std::path::Path;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 pub use model::{Node, NodeKind, Snapshot};
+pub use rules::RuleSet;
 pub use scan::ScanOptions;
+pub use suggest::{Finding, analyze};
 
 /// The APFS Data volume. Scanning it (rather than `/`) covers all user data once,
 /// without walking the read-only System volume or double-counting firmlinks.
