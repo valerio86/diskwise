@@ -13,10 +13,11 @@ how to use it; this file covers how to work on it and what's next.
 | — | Linux support (CI on Ubuntu + macOS) | done |
 | 3a | Terminal UI `diskwise tui` | done |
 | 3b | Desktop app (Tauri 2), `crates/diskwise-app` | first version done |
-| 4 | Optional local LLM to explain unrecognised folders | **planned below** |
+| 4 | Duplicates, older versions, growth ("correlation" findings) | **in progress**: 4.1 core + CLI done |
+| 5 | Optional local LLM to explain unrecognised folders | planned below |
 
 Two full code reviews have been done and every finding fixed (commits 1ad8f48,
-0b0d063). 60 tests; clippy clean on macOS, Linux and the app.
+0b0d063). 68 tests; clippy clean on macOS, Linux and the app.
 
 ## Decisions already made (don't relitigate)
 
@@ -95,7 +96,102 @@ target/release/diskwise tui         # TUI
   scheduled scans with "what grew since last time", generic rules for shares
   outside home folders (e.g. `/srv`).
 
-## Phase 4 plan: explain what no rule recognises
+## Phase 4: duplicates, older versions, growth
+
+Decided with the user 2026-11-26: do this **before** the LLM (facts beat
+guesses, and it shrinks what's left to explain). Order: exact file dupes →
+duplicate folders → older versions → growth between snapshots. **Suggest only**:
+no archive action yet (an "archive to another volume" action may come later and
+needs its own design, since it breaks the "only ever the Trash" model).
+**Minimal user input**: runs over the whole home folder without being asked.
+
+### 4.1 Exact duplicate files: done (`crates/diskwise-core/src/dupes.rs`)
+
+- **The scan collects candidates** as it walks, so there's no second walk:
+  `ScanOptions::large_file_min` (default 1 MiB) → `Snapshot::large_files`
+  (snapshot version 5; older snapshots load with it empty). Only files in
+  people's own places are collected: inside home folders when the root contains
+  them (`/`, `/Users`), or anywhere under a root that doesn't (`/srv`, an
+  external drive). Never ~/Library, home dot-folders, `.git`/`node_modules`/
+  caches, or packages (`.app`, `.photoslibrary`, `.lrdata`, …): deleting one
+  "duplicate" there breaks the owner. Only files whose size another candidate
+  shares are kept (home: ~1.3k entries).
+- **`dupes::find`**: checks that each file is unchanged since the scan, groups
+  by size, then by BLAKE3 of the first and last 64 KiB (always, so cached and
+  uncached copies stay comparable), then by full BLAKE3 (cached by path, size,
+  mtime and inode in `~/Library/Caches/diskwise/hashes.json`, or
+  `$XDG_CACHE_HOME/diskwise` on Linux).
+- **Reclaimable = what deleting really frees.** Hard links (nlink > 1) free 0.
+  macOS: APFS *private size* via `getattrlist(ATTR_CMNEXT_PRIVATESIZE)`, so
+  clones free 0 (tested strictly with `cp -c`; the repo and CI are on APFS).
+  Linux: FIEMAP, and any shared extent counts the file as 0. Always errs low.
+  Groups that would free nothing are reported separately as `already_shared`.
+- **Which copy to keep**: lowest "stray copy" score (Downloads/Desktop/tmp,
+  `copy`, `(1)`, `backup`/`old`/`archive` folders), then by **creation time**
+  (`LargeFile::created`; Finder copies keep the original's mtime, so mtime
+  can't tell them apart) per `Prefer::Original` (default) or
+  `Prefer::NewestCopy`, then shortest path. First copy in `Group::copies` is
+  the keeper. The automatic pick is only a default: the user must be able to
+  override it (see 4.2).
+- **A suggested action per extra copy** (`Copy::action`), decided with the user:
+  - `Trash`: a clear stray copy. Same folder as the keeper, with the keeper's
+    name plus a copy marker (`copy`, `copy 2`, `(1)`, `_1`, `-2`, `Copy of …`).
+    Judged *relative to the keeper*, so `IMG_1.jpg` alone never counts.
+  - `StoreOnce`: in doubt (same contents elsewhere; something may refer to that
+    path). Replace it with a clone of the keeper, so both paths keep working and
+    the contents are stored once. Only on the keeper's volume, and only where
+    clones work (`platform::can_clone`: APFS; btrfs/XFS).
+  - `Review`: in doubt, but a clone isn't possible: Trash only, the user's call.
+  - `Nothing`: already shares storage with the keeper.
+  - On the user's home: 20 copies (145 MB) Trash, 499 (2.3 GB) StoreOnce.
+- **`diskwise dupes [PATH]`** (default `$HOME`; `--from`, `--top`, `--json`,
+  `--no-cache`, `--prefer original|newest`). On the user's home: 2.4 GB in 394 groups, ~5 s; reruns use the
+  cache for hashing (the scan dominates).
+
+### 4.2 next: duplicate folders, then the UIs
+
+- **Duplicate folders**: fingerprint each folder bottom-up from its files'
+  (name, size, hash) and report the *top* duplicated folder, not 4,000 files
+  inside it (real case: `~/Downloads/New FLC` is a copy of
+  `~/Documents/New FLC`). Then near-duplicates (≥ 90% same: "a copy that
+  drifted"). Small files inside such folders matter here, so `large_files`
+  may need to cover them; measure the snapshot size first.
+- **TUI and desktop**: a "Duplicates" group under Suggestions, filled in the
+  background after the scan (`DupeProgress` exists for a progress bar). Safety
+  at most "caution".
+- **Choosing the keeper**, least input first: (1) swap the keeper per group;
+  (2) on a swap, offer "always prefer folder A over folder B", saved in a small
+  preferences file and applied to every group with that pair of folders (copies
+  come in batches); (3) the `Prefer` setting (original / newest copy). After a
+  swap, actions are recomputed against the new keeper.
+- **"Store once" action**: on the copy's volume, clone the keeper next to the
+  copy (`clonefile` on macOS, `FICLONE` on Linux), carry over the copy's own
+  metadata (permissions, owner, Finder tags and other xattrs, creation and
+  modification dates), check the clone hashes the same, then `rename` it over
+  the copy (atomic). Re-check the copy is unchanged right before. Never
+  symlinks or hard links (the user finds them heavy-handed, and hard links
+  make later edits show up in both).
+- **References to a trashed copy** aren't tracked in general (too hard to do
+  cleanly). Cheap safeguards only: it's the Trash (recoverable); warn if a
+  symlink in the scan points at the copy; warn when project or library files
+  sit nearby (e.g. a Lightroom catalog). "Store once" sidesteps the issue,
+  which is why it's the in-doubt default.
+- **Acting on duplicates needs a file-level trash check.** `check_trash` only
+  accepts nodes in the tree, and files under `min_node_size` (10 MB) are folded
+  into "(smaller items)". Add a check against the `LargeFile` record (same
+  size, mtime, inode; never the last remaining copy; re-hash before trashing),
+  keeping every other `Protection` rule.
+
+### 4.3 later: older versions, growth
+
+- Older versions: names that match after normalising (`_v2`, `-final`, dates,
+  `(1)`), same type, different mtimes; installers of one product at several
+  versions. Always "review" ("keep the newest" is a guess).
+- Cold data (large, untouched for 2+ years) as an archive suggestion.
+- Growth between snapshots ("what grew since last time"): also on the server
+  wish list.
+
+## Phase 5 plan: explain what no rule recognises
 
 ### Goal
 

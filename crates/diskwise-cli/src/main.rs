@@ -90,6 +90,32 @@ enum Command {
         #[arg(long)]
         cross_mounts: bool,
     },
+    /// Find files with identical contents (default: in your home folder).
+    ///
+    /// Only files of 1 MB or more in your own folders are compared: not ~/Library,
+    /// tools' dot-folders, app packages or version-control data. Space is what
+    /// deleting the extra copies would really free, so hard links and APFS
+    /// clones count as nothing. Nothing is deleted.
+    Dupes {
+        /// Folder to look in (default: your home folder).
+        path: Option<PathBuf>,
+        /// Use a saved snapshot instead of scanning (made with version 5 or later).
+        #[arg(long)]
+        from: Option<PathBuf>,
+        /// How many groups to list.
+        #[arg(long, default_value_t = 20)]
+        top: usize,
+        /// Print the report as JSON.
+        #[arg(long)]
+        json: bool,
+        /// Don't read or update the hash cache.
+        #[arg(long)]
+        no_cache: bool,
+        /// When location and names don't decide which copy to keep: the
+        /// original (oldest) or the newest copy.
+        #[arg(long, value_enum, default_value = "original")]
+        prefer: PreferArg,
+    },
     /// List the rules in effect.
     Rules {
         /// Your own rules file (TOML), listed first.
@@ -99,6 +125,12 @@ enum Command {
         #[arg(long)]
         os: Option<String>,
     },
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum PreferArg {
+    Original,
+    Newest,
 }
 
 #[derive(clap::Args)]
@@ -129,7 +161,7 @@ fn main() -> Result<()> {
             let opts = ScanOptions {
                 min_node_size: min_size,
                 one_filesystem: !cross_mounts,
-                progress: None,
+                ..Default::default()
             };
             let snap = diskwise_core::snapshot(&path, opts, !no_system)
                 .with_context(|| format!("scanning {}", path.display()))?;
@@ -191,6 +223,51 @@ fn main() -> Result<()> {
                 cross_mounts,
             })?;
         }
+        Command::Dupes {
+            path,
+            from,
+            top,
+            json,
+            no_cache,
+            prefer,
+        } => {
+            let snap = match from {
+                Some(file) => load_snapshot(&file)?,
+                None => {
+                    let path = match path {
+                        Some(p) => p,
+                        None => std::env::var_os("HOME")
+                            .map(PathBuf::from)
+                            .context("HOME isn't set; give a folder to look in")?,
+                    };
+                    eprintln!("Scanning {} …", path.display());
+                    diskwise_core::snapshot(&path, ScanOptions::default(), false)
+                        .with_context(|| format!("scanning {}", path.display()))?
+                }
+            };
+            if snap.version < 5 {
+                anyhow::bail!("this snapshot predates duplicate detection; scan again");
+            }
+            let cache = if no_cache {
+                None
+            } else {
+                diskwise_core::dupes::default_cache_path()
+            };
+            eprintln!(
+                "Comparing {} files of 1 MB or more …",
+                snap.large_files.len()
+            );
+            let prefer = match prefer {
+                PreferArg::Original => diskwise_core::dupes::Prefer::Original,
+                PreferArg::Newest => diskwise_core::dupes::Prefer::NewestCopy,
+            };
+            let report = diskwise_core::dupes::find(&snap, cache.as_deref(), None, prefer);
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                print_dupes(&report, top);
+            }
+        }
         Command::Rules { rules, os } => {
             let p = match os.as_deref() {
                 None => platform::CURRENT,
@@ -230,6 +307,79 @@ fn load_rules(platform: &Platform, user: Option<&Path>) -> Result<RuleSet> {
             let text = fs::read_to_string(p).with_context(|| format!("reading {}", p.display()))?;
             RuleSet::with_user_rules(platform, &p.display().to_string(), &text)
         }
+    }
+}
+
+fn print_dupes(r: &diskwise_core::dupes::Report, top: usize) {
+    use diskwise_core::dupes::{Action, Shared};
+    if r.groups.is_empty() {
+        println!("No duplicates that would free space.");
+    } else {
+        let copies: usize = r.groups.iter().map(|g| g.copies.len() - 1).sum();
+        println!(
+            "{} reclaimable: {} extra copies of {} files.",
+            human_bytes(r.reclaimable()),
+            copies,
+            r.groups.len()
+        );
+        println!("The first path of each group is the suggested one to keep. For the others:");
+        println!(
+            "  trash       a stray copy next to it (\"copy\", \"(1)\", \"_1\"): move to the Trash"
+        );
+        println!(
+            "  store once  same name elsewhere, something may refer to it: replace with a clone,"
+        );
+        println!("              so both paths keep working and the contents are stored once");
+        println!("  review      in doubt, and a clone isn't possible here: your call\n");
+    }
+    for g in r.groups.iter().take(top) {
+        println!(
+            "{:>9}  {} copies of {}",
+            human_bytes(g.reclaimable),
+            g.copies.len(),
+            human_bytes(g.size)
+        );
+        for (i, c) in g.copies.iter().enumerate() {
+            let mark = match (i, c.action) {
+                (0, _) => "keep",
+                (_, Some(Action::Trash)) => "trash",
+                (_, Some(Action::StoreOnce)) => "store once",
+                (_, Some(Action::Review)) => "review",
+                (_, Some(Action::Nothing) | None) => "",
+            };
+            let note = match c.shared {
+                Some(Shared::HardLink) => "  (hard link: frees nothing)",
+                Some(Shared::Clone) if c.frees == 0 => "  (clone: frees nothing)",
+                Some(Shared::Clone) => "  (partly shared with another file)",
+                None => "",
+            };
+            println!("    {mark:>10}  {}{note}", c.path);
+        }
+    }
+    if r.groups.len() > top {
+        println!(
+            "… and {} more groups (--top to see more).",
+            r.groups.len() - top
+        );
+    }
+    if !r.already_shared.is_empty() {
+        println!(
+            "\n{} more groups are already hard links or clones of each other, so deleting copies wouldn't free anything.",
+            r.already_shared.len()
+        );
+    }
+    let mut notes = Vec::new();
+    if r.changed > 0 {
+        notes.push(format!(
+            "{} files changed since the scan and were skipped",
+            r.changed
+        ));
+    }
+    if r.errors > 0 {
+        notes.push(format!("{} files couldn't be read", r.errors));
+    }
+    if !notes.is_empty() {
+        println!("\nNote: {}.", notes.join("; "));
     }
 }
 

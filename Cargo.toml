@@ -13,6 +13,7 @@ license = "MIT"
 [workspace.dependencies]
 diskwise-core = { path = "crates/diskwise-core" }
 anyhow = "1"
+blake3 = "1"
 clap = { version = "4", features = ["derive"] }
 globset = "0.4"
 libc = "0.2"

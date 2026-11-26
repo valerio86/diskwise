@@ -786,6 +786,7 @@ mod test_support {
             errors: ErrorSummary::default(),
             skipped_mounts: vec![],
             system: None,
+            large_files: vec![],
         };
         let findings = vec![
             finding(

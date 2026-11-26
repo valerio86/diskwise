@@ -114,3 +114,57 @@ fn local_snapshots() -> Result<Vec<String>> {
         .map(String::from)
         .collect())
 }
+
+/// Bytes of a file that no other file shares (APFS "private size"): 0 for a full
+/// clone, its whole allocation for an ordinary file. `None` if the filesystem
+/// doesn't say (HFS+, exFAT, network volumes).
+pub(crate) fn private_size(path: &Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut req: libc::attrlist = unsafe { std::mem::zeroed() };
+    req.bitmapcount = libc::ATTR_BIT_MAP_COUNT;
+    req.commonattr = libc::ATTR_CMN_RETURNED_ATTRS;
+    // With FSOPT_ATTR_CMN_EXTENDED, `forkattr` selects extended common attributes.
+    req.forkattr = libc::ATTR_CMNEXT_PRIVATESIZE;
+
+    // Reply: u32 length, the attribute_set_t of what was returned, then the off_t.
+    #[repr(C, packed(4))]
+    struct Reply {
+        length: u32,
+        returned: libc::attribute_set_t,
+        private_size: libc::off_t,
+    }
+    let mut reply: Reply = unsafe { std::mem::zeroed() };
+    let rc = unsafe {
+        libc::getattrlist(
+            c_path.as_ptr(),
+            (&mut req as *mut libc::attrlist).cast(),
+            (&mut reply as *mut Reply).cast(),
+            std::mem::size_of::<Reply>(),
+            libc::FSOPT_NOFOLLOW | libc::FSOPT_ATTR_CMN_EXTENDED,
+        )
+    };
+    let returned = reply.returned.forkattr;
+    let size = reply.private_size;
+    (rc == 0 && returned & libc::ATTR_CMNEXT_PRIVATESIZE != 0 && size >= 0).then_some(size as u64)
+}
+
+/// Where diskwise keeps caches: ~/Library/Caches/diskwise.
+pub(crate) fn cache_dir() -> Option<std::path::PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    Some(Path::new(&home).join("Library/Caches/diskwise"))
+}
+
+/// Whether the volume holding `path` can make clones (APFS).
+pub(crate) fn can_clone(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statfs(c_path.as_ptr(), &mut st) } != 0 {
+        return false;
+    }
+    let name = unsafe { std::ffi::CStr::from_ptr(st.f_fstypename.as_ptr()) };
+    name.to_bytes() == b"apfs"
+}

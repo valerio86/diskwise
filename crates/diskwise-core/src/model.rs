@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Version of the JSON snapshot format. Bump when the shape changes.
-pub const SNAPSHOT_VERSION: u32 = 4;
+pub const SNAPSHOT_VERSION: u32 = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -87,6 +87,30 @@ pub struct Snapshot {
     pub skipped_mounts: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system: Option<crate::system::SystemInfo>,
+    /// Files that could have duplicates: big enough to matter, in places where
+    /// people keep their own files, and sharing their size with another file.
+    /// Input for `dupes::find`; empty in snapshots older than version 5.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub large_files: Vec<LargeFile>,
+}
+
+/// One file the scan noted as a possible duplicate (see `Snapshot::large_files`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LargeFile {
+    /// Display path (as `Snapshot::path_of` gives it).
+    pub path: String,
+    /// Logical size in bytes.
+    pub size: u64,
+    pub allocated: u64,
+    pub mtime: i64,
+    /// Creation (birth) time, Unix seconds; 0 if the filesystem doesn't record it.
+    /// A Finder copy keeps the original's mtime but gets a new creation time, so
+    /// this is what tells an original from its copies.
+    #[serde(default)]
+    pub created: i64,
+    pub dev: u64,
+    pub ino: u64,
+    pub nlink: u64,
 }
 
 impl Snapshot {

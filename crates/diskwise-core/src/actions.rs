@@ -207,6 +207,23 @@ impl Protection {
         }
     }
 
+    /// Whether `path` is a home folder itself.
+    pub fn is_home(&self, path: &str) -> bool {
+        let path = path.trim_end_matches('/');
+        let parent = Path::new(path)
+            .parent()
+            .and_then(|p| p.to_str())
+            .unwrap_or("");
+        self.homes.iter().any(|h| h == path) || self.home_bases.iter().any(|b| b == parent)
+    }
+
+    /// Whether `path` is, or contains, the folder home folders live in.
+    pub fn contains_homes(&self, path: &str) -> bool {
+        let path = path.trim_end_matches('/');
+        let holds = |p: &String| p == path || path.is_empty() || inside(p, path);
+        self.home_bases.iter().any(holds)
+    }
+
     /// Whether `path` is inside someone's home folder (where users keep their own files).
     pub fn in_home(&self, path: &str) -> bool {
         self.homes.iter().any(|h| inside(path, h))
@@ -373,6 +390,7 @@ mod tests {
             errors: ErrorSummary::default(),
             skipped_mounts: vec![],
             system: None,
+            large_files: vec![],
         }
     }
 

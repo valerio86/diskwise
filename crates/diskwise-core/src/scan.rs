@@ -7,7 +7,9 @@ use std::sync::{Arc, Mutex};
 
 use rayon::prelude::*;
 
-use crate::model::{ErrorSummary, Node, NodeKind};
+use crate::actions::Protection;
+use crate::dupes;
+use crate::model::{ErrorSummary, LargeFile, Node, NodeKind};
 
 const MAX_ERROR_SAMPLES: usize = 50;
 
@@ -19,6 +21,8 @@ pub struct ScanOptions {
     pub one_filesystem: bool,
     /// Live counters for a progress display (updated while scanning).
     pub progress: Option<Arc<ScanProgress>>,
+    /// Note files at least this big as possible duplicates (`None`: don't).
+    pub large_file_min: Option<u64>,
 }
 
 impl Default for ScanOptions {
@@ -27,6 +31,7 @@ impl Default for ScanOptions {
             min_node_size: 10 * 1024 * 1024,
             one_filesystem: true,
             progress: None,
+            large_file_min: Some(dupes::DEFAULT_MIN_SIZE),
         }
     }
 }
@@ -47,6 +52,8 @@ struct Ctx {
     error_count: AtomicU64,
     error_samples: Mutex<Vec<String>>,
     skipped_mounts: Mutex<Vec<String>>,
+    protection: Protection,
+    large_files: Mutex<Vec<LargeFile>>,
 }
 
 /// What one scan found.
@@ -55,6 +62,8 @@ pub struct ScanOutput {
     pub errors: ErrorSummary,
     /// Mount points of other filesystems that were not entered.
     pub skipped_mounts: Vec<String>,
+    /// Possible duplicates (see `Snapshot::large_files`), sorted by path.
+    pub large_files: Vec<LargeFile>,
 }
 
 impl Ctx {
@@ -94,22 +103,46 @@ pub fn scan(root: &Path, opts: ScanOptions) -> std::io::Result<ScanOutput> {
         error_count: AtomicU64::new(0),
         error_samples: Mutex::new(Vec::new()),
         skipped_mounts: Mutex::new(Vec::new()),
+        protection: Protection::for_platform(crate::platform::CURRENT),
+        large_files: Mutex::new(Vec::new()),
     };
-    let tree = scan_dir(root, root.display().to_string(), &meta, &ctx);
+    let display = crate::platform::CURRENT.display_path(&root.display().to_string());
+    let collect =
+        ctx.opts.large_file_min.is_some() && dupes::collect_at_root(&display, &ctx.protection);
+    let tree = scan_dir(
+        root,
+        root.display().to_string(),
+        &meta,
+        &ctx,
+        &display,
+        collect,
+    );
     let errors = ErrorSummary {
         count: ctx.error_count.load(Ordering::Relaxed),
         samples: ctx.error_samples.into_inner().unwrap(),
     };
     let mut skipped_mounts = ctx.skipped_mounts.into_inner().unwrap();
     skipped_mounts.sort();
+    let mut large_files = ctx.large_files.into_inner().unwrap();
+    dupes::keep_size_collisions(&mut large_files);
     Ok(ScanOutput {
         tree,
         errors,
         skipped_mounts,
+        large_files,
     })
 }
 
-fn scan_dir(path: &Path, name: String, meta: &Metadata, ctx: &Ctx) -> Node {
+/// `display` is the folder's display path; `collect` says whether to note its
+/// large files as possible duplicates.
+fn scan_dir(
+    path: &Path,
+    name: String,
+    meta: &Metadata,
+    ctx: &Ctx,
+    display: &str,
+    collect: bool,
+) -> Node {
     let min = ctx.opts.min_node_size;
     let mut node = Node::new(name, NodeKind::Dir);
     node.allocated = meta.blocks() * 512;
@@ -163,7 +196,23 @@ fn scan_dir(path: &Path, name: String, meta: &Metadata, ctx: &Ctx) -> Node {
                 }
                 continue;
             }
-            subdirs.push((child_path, child_name, child_meta, lossy));
+            let child_display = join(display, &child_name);
+            let child_collect = collect_ok(ctx, lossy)
+                && dupes::collect_in(
+                    collect,
+                    display,
+                    &child_name,
+                    &child_display,
+                    &ctx.protection,
+                );
+            subdirs.push((
+                child_path,
+                child_name,
+                child_meta,
+                lossy,
+                child_display,
+                child_collect,
+            ));
             continue;
         }
 
@@ -198,13 +247,32 @@ fn scan_dir(path: &Path, name: String, meta: &Metadata, ctx: &Ctx) -> Node {
         }
         file.newest_mtime = child_meta.mtime();
         file.lossy_name = lossy;
+        if collect
+            && !lossy
+            && child_meta.is_file()
+            && ctx
+                .opts
+                .large_file_min
+                .is_some_and(|min| child_meta.len() >= min)
+        {
+            ctx.large_files.lock().unwrap().push(LargeFile {
+                path: join(display, &file.name),
+                size: child_meta.len(),
+                allocated: child_meta.blocks() * 512,
+                mtime: child_meta.mtime(),
+                created: birth_time(&child_meta),
+                dev: child_meta.dev(),
+                ino: child_meta.ino(),
+                nlink: child_meta.nlink(),
+            });
+        }
         place(&mut node, &mut rest, file, min);
     }
 
     let children: Vec<Node> = subdirs
         .into_par_iter()
-        .map(|(p, n, m, lossy)| {
-            let mut d = scan_dir(&p, n, &m, ctx);
+        .map(|(p, n, m, lossy, disp, collect)| {
+            let mut d = scan_dir(&p, n, &m, ctx, &disp, collect);
             d.lossy_name = lossy;
             d
         })
@@ -226,6 +294,27 @@ fn scan_dir(path: &Path, name: String, meta: &Metadata, ctx: &Ctx) -> Node {
     node.children
         .sort_by_key(|c| std::cmp::Reverse(c.allocated));
     node
+}
+
+/// Creation time in Unix seconds, or 0 if the filesystem doesn't record one.
+fn birth_time(meta: &Metadata) -> i64 {
+    meta.created()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_secs() as i64)
+}
+
+/// Files under a folder whose name isn't exact can't be acted on, so don't note them.
+fn collect_ok(ctx: &Ctx, lossy: bool) -> bool {
+    ctx.opts.large_file_min.is_some() && !lossy
+}
+
+fn join(dir: &str, name: &str) -> String {
+    if dir.ends_with('/') {
+        format!("{dir}{name}")
+    } else {
+        format!("{dir}/{name}")
+    }
 }
 
 /// Add `child`'s totals to `parent`, keeping it as a listed child only if it is big enough.

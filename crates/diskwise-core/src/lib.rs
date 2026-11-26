@@ -2,6 +2,7 @@
 //! can't see, and turn both into cleanup suggestions. Supports macOS and Linux.
 
 pub mod actions;
+pub mod dupes;
 pub mod model;
 pub mod platform;
 pub mod provenance;
@@ -33,6 +34,7 @@ pub fn snapshot(root: &Path, opts: ScanOptions, with_system: bool) -> std::io::R
         tree,
         errors,
         skipped_mounts,
+        large_files,
     } = scan::scan(root, opts)?;
     let system = with_system.then(|| system::probe(&root.display().to_string()));
     // Kernel and in-memory filesystems (/proc, /dev, /run, …) don't count as "not
@@ -55,6 +57,7 @@ pub fn snapshot(root: &Path, opts: ScanOptions, with_system: bool) -> std::io::R
         errors,
         skipped_mounts,
         system,
+        large_files,
     })
 }
 

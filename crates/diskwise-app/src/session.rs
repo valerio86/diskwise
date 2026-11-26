@@ -679,6 +679,7 @@ mod tests {
             errors: ErrorSummary::default(),
             skipped_mounts: vec![],
             system: None,
+            large_files: vec![],
         };
         // A snapshot from another OS: fine for viewing, never live.
         Session::new(
@@ -761,6 +762,7 @@ mod tests {
             errors: ErrorSummary::default(),
             skipped_mounts: vec![],
             system: None,
+            large_files: vec![],
         };
         let rules = format!(
             r#"

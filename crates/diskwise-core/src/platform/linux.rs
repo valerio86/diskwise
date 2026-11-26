@@ -57,3 +57,95 @@ pub(crate) fn set_download_urls(path: &Path, urls: &[&str]) -> bool {
         .zip(urls)
         .all(|(attr, url)| xattr::set(path, attr, url.as_bytes()).is_ok())
 }
+
+/// Bytes of a file that no other file shares. Linux reports shared extents
+/// (reflinks on btrfs/XFS) but not how much of a file they cover, so a file with
+/// any counts as `Some(0)`: an underestimate, never an overestimate. `None` if
+/// the filesystem can't say.
+pub(crate) fn private_size(path: &Path) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::io::AsRawFd;
+
+    const FS_IOC_FIEMAP: libc::c_ulong = 0xC020_660B; // _IOWR('f', 11, struct fiemap)
+    const FIEMAP_FLAG_SYNC: u32 = 0x1;
+    const FIEMAP_EXTENT_LAST: u32 = 0x1;
+    const FIEMAP_EXTENT_SHARED: u32 = 0x2000;
+    const BATCH: usize = 64;
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct Extent {
+        logical: u64,
+        physical: u64,
+        length: u64,
+        reserved64: [u64; 2],
+        flags: u32,
+        reserved: [u32; 3],
+    }
+    #[repr(C)]
+    struct Fiemap {
+        start: u64,
+        length: u64,
+        flags: u32,
+        mapped_extents: u32,
+        extent_count: u32,
+        reserved: u32,
+        extents: [Extent; BATCH],
+    }
+
+    let file = std::fs::File::open(path).ok()?;
+    let allocated = file.metadata().ok()?.blocks() * 512;
+    let mut start = 0u64;
+    // Bounded: a pathological file with millions of extents isn't worth walking.
+    for _ in 0..1024 {
+        let mut map: Fiemap = unsafe { std::mem::zeroed() };
+        map.start = start;
+        map.length = u64::MAX - start;
+        map.flags = FIEMAP_FLAG_SYNC;
+        map.extent_count = BATCH as u32;
+        let rc = unsafe { libc::ioctl(file.as_raw_fd(), FS_IOC_FIEMAP as _, &mut map) };
+        if rc != 0 {
+            return None;
+        }
+        let n = map.mapped_extents as usize;
+        if n == 0 {
+            return Some(allocated);
+        }
+        for e in &map.extents[..n.min(BATCH)] {
+            if e.flags & FIEMAP_EXTENT_SHARED != 0 {
+                return Some(0);
+            }
+            if e.flags & FIEMAP_EXTENT_LAST != 0 {
+                return Some(allocated);
+            }
+        }
+        let last = map.extents[n.min(BATCH) - 1];
+        start = last.logical + last.length;
+    }
+    None
+}
+
+/// Where diskwise keeps caches: $XDG_CACHE_HOME/diskwise or ~/.cache/diskwise.
+pub(crate) fn cache_dir() -> Option<std::path::PathBuf> {
+    if let Some(x) = std::env::var_os("XDG_CACHE_HOME").filter(|x| Path::new(x).is_absolute()) {
+        return Some(Path::new(&x).join("diskwise"));
+    }
+    let home = std::env::var_os("HOME")?;
+    Some(Path::new(&home).join(".cache/diskwise"))
+}
+
+/// Whether the filesystem holding `path` can make reflink clones (btrfs, XFS).
+/// XFS can be formatted without reflink support; acting on a clone checks again.
+pub(crate) fn can_clone(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    const BTRFS_SUPER_MAGIC: i64 = 0x9123_683E;
+    const XFS_SUPER_MAGIC: i64 = 0x5846_5342;
+    let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statfs(c_path.as_ptr(), &mut st) } != 0 {
+        return false;
+    }
+    matches!(st.f_type as i64, BTRFS_SUPER_MAGIC | XFS_SUPER_MAGIC)
+}

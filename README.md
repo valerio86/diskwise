@@ -12,7 +12,8 @@ safe ways to reclaim it.
 | 2 | Rules engine + `suggest`: caches, regenerable data, app-managed data, your data, system space | ✅ |
 | 3a | Terminal UI (`diskwise tui`): browse, suggestions, move to Trash with verification | ✅ |
 | 3b | Desktop app (Tauri): treemap, suggestions, move to Trash | ✅ first version |
-| 4 | Optional local LLM to explain unrecognised folders | ⏳ |
+| 4 | Duplicates (`diskwise dupes`), older versions, growth over time | ⏳ exact duplicate files done |
+| 5 | Optional local LLM to explain unrecognised folders | ⏳ |
 
 ## Usage
 
@@ -25,6 +26,7 @@ cargo build --release
 ./target/release/diskwise suggest                    # scan + cleanup suggestions
 ./target/release/diskwise suggest -c                 # one line per suggestion
 ./target/release/diskwise suggest --from disk.snapshot.json --json
+./target/release/diskwise dupes                      # duplicate files in your home folder
 ./target/release/diskwise rules                      # list rules in effect
 ./target/release/diskwise tui                        # interactive browser
 ./target/release/diskwise tui --from disk.snapshot.json
@@ -163,6 +165,22 @@ Both the TUI and the desktop app go through one check before anything moves:
 
 Each suggestion says what the item is, how to clear it, and, where it matters,
 how to stop it coming back (e.g. Chrome re-downloads its AI model unless a policy is set).
+
+## Duplicates
+
+`diskwise dupes [FOLDER]` (default: your home folder) finds files of 1 MB or
+more with identical contents and suggests which copy to keep (the one outside
+Downloads/Desktop, without "copy" or "(1)" in its name, then the oldest). It
+deletes nothing.
+
+- Only your own files are compared: not ~/Library, tools' dot-folders, app
+  packages (`.app`, Photos/Lightroom libraries) or `.git`/`node_modules`.
+- The space shown is what deleting the extra copies would **really** free.
+  Hard links and APFS clones (Finder's Duplicate) share storage, so they count
+  as nothing; on Linux, files with reflinked extents count as nothing too.
+- Files are compared by size, then their first and last 64 KB, then a full
+  BLAKE3 hash. Full hashes are cached (`~/Library/Caches/diskwise`,
+  `~/.cache/diskwise` on Linux), so reruns only read files that changed.
 
 ### Rules
 

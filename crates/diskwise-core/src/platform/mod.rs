@@ -16,11 +16,11 @@ compile_error!("diskwise supports macOS and Linux");
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) use linux::set_download_urls;
 #[cfg(target_os = "linux")]
-pub(crate) use linux::{download_urls, probe};
+pub(crate) use linux::{cache_dir, can_clone, download_urls, private_size, probe};
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) use macos::set_download_urls;
 #[cfg(target_os = "macos")]
-pub(crate) use macos::{download_urls, probe};
+pub(crate) use macos::{cache_dir, can_clone, download_urls, private_size, probe};
 
 /// Rules shared by every platform; tried after the platform's own rules.
 pub const COMMON_RULES: &str = include_str!("../../rules/common.toml");

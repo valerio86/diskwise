@@ -388,6 +388,7 @@ mod tests {
             tree,
             errors: ErrorSummary::default(),
             skipped_mounts: vec![],
+            large_files: vec![],
             system: Some(SystemInfo {
                 container: Some(ContainerInfo {
                     reference: "disk3".into(),
