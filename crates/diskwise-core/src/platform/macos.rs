@@ -186,14 +186,8 @@ pub(crate) fn clone_file(src: &Path, dst: &Path) -> std::io::Result<()> {
     }
 }
 
-/// macOS file flags (hidden, locked, …), set last since "locked" blocks changes.
-pub(crate) fn copy_flags(from: &std::fs::Metadata, to: &Path) -> std::io::Result<()> {
-    use std::os::darwin::fs::MetadataExt;
+fn set_flags(to: &Path, flags: u32) -> std::io::Result<()> {
     use std::os::unix::ffi::OsStrExt;
-    let flags = from.st_flags();
-    if flags == 0 {
-        return Ok(());
-    }
     let p = std::ffi::CString::new(to.as_os_str().as_bytes())
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in path"))?;
     if unsafe { libc::lchflags(p.as_ptr(), flags) } == 0 {
@@ -201,6 +195,24 @@ pub(crate) fn copy_flags(from: &std::fs::Metadata, to: &Path) -> std::io::Result
     } else {
         Err(std::io::Error::last_os_error())
     }
+}
+
+/// Clear every file flag (hidden, locked, …) that a clone inherited.
+pub(crate) fn clear_flags(to: &Path) -> std::io::Result<()> {
+    use std::os::darwin::fs::MetadataExt;
+    if std::fs::symlink_metadata(to)?.st_flags() == 0 {
+        return Ok(());
+    }
+    set_flags(to, 0)
+}
+
+/// Give `to` exactly the file flags of `from` (set last: "locked" blocks changes).
+pub(crate) fn copy_flags(from: &std::fs::Metadata, to: &Path) -> std::io::Result<()> {
+    use std::os::darwin::fs::MetadataExt;
+    if std::fs::symlink_metadata(to)?.st_flags() == from.st_flags() {
+        return Ok(());
+    }
+    set_flags(to, from.st_flags())
 }
 
 /// Also carry over the creation date.

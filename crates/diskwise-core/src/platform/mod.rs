@@ -17,15 +17,15 @@ compile_error!("diskwise supports macOS and Linux");
 pub(crate) use linux::set_download_urls;
 #[cfg(target_os = "linux")]
 pub(crate) use linux::{
-    cache_dir, can_clone, clone_file, config_dir, copy_flags, download_urls, private_size, probe,
-    with_created,
+    cache_dir, can_clone, clear_flags, clone_file, config_dir, copy_flags, download_urls,
+    private_size, probe, with_created,
 };
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) use macos::set_download_urls;
 #[cfg(target_os = "macos")]
 pub(crate) use macos::{
-    cache_dir, can_clone, clone_file, config_dir, copy_flags, download_urls, private_size, probe,
-    with_created,
+    cache_dir, can_clone, clear_flags, clone_file, config_dir, copy_flags, download_urls,
+    private_size, probe, with_created,
 };
 
 /// Rules shared by every platform; tried after the platform's own rules.

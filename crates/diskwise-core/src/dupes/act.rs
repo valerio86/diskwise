@@ -43,6 +43,17 @@ pub struct Done {
     pub cloned: u64,
     /// Files skipped by store once because they already share storage.
     pub already_shared: u64,
+    /// Store once on a folder stopped partway: what went wrong. The files
+    /// counted in `cloned` were replaced; the rest weren't touched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stopped: Option<String>,
+}
+
+impl Done {
+    /// Whether anything was freed (a Trash move, or at least one clone).
+    pub fn freed_anything(&self, how: How) -> bool {
+        how == How::Trash || self.cloned > 0
+    }
 }
 
 /// One step of a group's plan.
@@ -274,10 +285,19 @@ fn store_once_folder(keeper: &Path, copy: &Path) -> Result<Done, String> {
     let mut done = Done::default();
     for (rel, e) in entries {
         if let Entry::File { real, .. } = e {
-            if store_once_file(&keeper.join(&rel), &real)? {
-                done.cloned += 1;
-            } else {
-                done.already_shared += 1;
+            match store_once_file(&keeper.join(&rel), &real) {
+                Ok(true) => done.cloned += 1,
+                Ok(false) => done.already_shared += 1,
+                // Nothing replaced yet: a plain failure.
+                Err(e) if done.cloned == 0 => return Err(e),
+                // Some files were replaced: report that, so callers record it.
+                Err(e) => {
+                    done.stopped = Some(format!(
+                        "{e} ({} file(s) before it were already stored once; the rest weren't changed)",
+                        done.cloned
+                    ));
+                    break;
+                }
             }
         }
     }
@@ -319,6 +339,12 @@ fn store_once_file(keeper: &Path, copy: &Path) -> Result<bool, String> {
 /// attributes (incl. Finder tags), owner, permissions, access/modification
 /// and (macOS) creation dates, and (macOS) file flags. ACLs aren't carried over.
 fn copy_metadata(meta: &fs::Metadata, from: &Path, to: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    // The clone came with the keeper's flags and mode: a locked (uchg) or
+    // read-only keeper would block every change below. Unlock it and make it
+    // writable for us first; the copy's own mode and flags go on last.
+    crate::platform::clear_flags(to)?;
+    fs::set_permissions(to, fs::Permissions::from_mode(0o600))?;
     // The clone came with the keeper's attributes: replace them with the copy's.
     for name in xattr::list(to)? {
         xattr::remove(to, &name)?;
@@ -332,12 +358,13 @@ fn copy_metadata(meta: &fs::Metadata, from: &Path, to: &Path) -> std::io::Result
     if (to_meta.uid(), to_meta.gid()) != (meta.uid(), meta.gid()) {
         std::os::unix::fs::lchown(to, Some(meta.uid()), Some(meta.gid()))?;
     }
-    fs::set_permissions(to, meta.permissions())?;
     let mut times = FileTimes::new()
         .set_accessed(meta.accessed()?)
         .set_modified(meta.modified()?);
     times = crate::platform::with_created(times, meta);
-    fs::File::options().write(true).open(to)?.set_times(times)?;
+    // Read-only is enough to set times as the owner.
+    fs::File::open(to)?.set_times(times)?;
+    fs::set_permissions(to, meta.permissions())?;
     crate::platform::copy_flags(meta, to)
 }
 
@@ -445,6 +472,44 @@ mod tests {
         assert!(r.groups.is_empty(), "{:?}", r.groups);
         let again = apply(&snap, &protection(), &t, How::StoreOnce, &no_trash).unwrap();
         assert_eq!(again.already_shared, 1);
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// Read-only copies, and a keeper that is hidden and locked in Finder:
+    /// the clone must end up with the copy's mode and flags, not the keeper's.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn store_once_read_only_and_flags() {
+        use std::os::darwin::fs::MetadataExt;
+        let d = dir("flags");
+        let a = content(9, 2 << 20);
+        write(&d.join("keep/a.bin"), &a);
+        write(&d.join("copy/a.bin"), &a);
+        let copy = d.join("copy/a.bin");
+        let keep = d.join("keep/a.bin");
+        fs::set_permissions(&copy, fs::Permissions::from_mode(0o444)).unwrap();
+        let chflags = |flag: &str, p: &Path| {
+            assert!(
+                std::process::Command::new("chflags")
+                    .arg(flag)
+                    .arg(p)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        };
+        chflags("hidden", &keep);
+        chflags("uchg", &keep);
+        let snap = scan(&d);
+        let t = target(&d, "keep/a.bin", "copy/a.bin", false);
+        let result = apply(&snap, &protection(), &t, How::StoreOnce, &no_trash);
+        chflags("nouchg", &keep); // so the test folder can be removed
+        assert_eq!(result.unwrap().cloned, 1);
+        let m = fs::symlink_metadata(&copy).unwrap();
+        assert_eq!(m.permissions().mode() & 0o777, 0o444);
+        assert_eq!(m.st_flags(), 0, "not hidden or locked like the keeper");
+        assert_eq!(private_size(&copy), Some(0));
+        fs::set_permissions(&copy, fs::Permissions::from_mode(0o644)).unwrap();
         fs::remove_dir_all(&d).unwrap();
     }
 

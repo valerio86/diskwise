@@ -317,11 +317,12 @@ async fn dupe_apply(
     app: AppHandle,
     state: State<'_, Arc<AppState>>,
     id: String,
+    steps: Vec<diskwise_core::dupes::act::Step>,
 ) -> Result<TrashResult, String> {
     let st = Arc::clone(&state);
     let result = tauri::async_runtime::spawn_blocking(move || {
         with_session(&st, |s| {
-            s.dupe_apply(&id, &diskwise_core::actions::move_to_trash)
+            s.dupe_apply(&id, &steps, &diskwise_core::actions::move_to_trash)
         })
     })
     .await

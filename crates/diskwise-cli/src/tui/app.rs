@@ -117,8 +117,12 @@ pub struct App {
     /// Which copy of the selected group is selected (0 = the keeper).
     pub copy_sel: usize,
     pub prefs: diskwise_core::dupes::Prefs,
+    /// None in tests, and when the saved file couldn't be read (so it's never
+    /// overwritten).
     prefs_path: Option<std::path::PathBuf>,
     dupe_cache: Option<std::path::PathBuf>,
+    /// Keepers and actions chosen this session, re-applied after each check.
+    choices: diskwise_core::dupes::Choices,
 }
 
 impl App {
@@ -153,12 +157,20 @@ impl App {
             dupe_groups: Vec::new(),
             dupe_sel: 0,
             copy_sel: 0,
-            prefs: dupes::prefs_location()
-                .map(|p| diskwise_core::dupes::Prefs::load(&p))
-                .unwrap_or_default(),
-            prefs_path: dupes::prefs_location(),
+            prefs: Default::default(),
+            prefs_path: None,
             dupe_cache: dupes::cache_location(),
+            choices: Default::default(),
         };
+        if let Some(path) = dupes::prefs_location() {
+            match diskwise_core::dupes::Prefs::load(&path) {
+                Ok(p) => {
+                    app.prefs = p;
+                    app.prefs_path = Some(path);
+                }
+                Err(e) => app.status = Some(e),
+            }
+        }
         // The scanner sorts "(smaller items)" by size like everything else; here it
         // always goes last.
         sort_tree(&mut app.snap.tree, SortBy::Size);

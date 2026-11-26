@@ -12,7 +12,7 @@ safe ways to reclaim it.
 | 2 | Rules engine + `suggest`: caches, regenerable data, app-managed data, your data, system space | ✅ |
 | 3a | Terminal UI (`diskwise tui`): browse, suggestions, move to Trash with verification | ✅ |
 | 3b | Desktop app (Tauri): treemap, suggestions, move to Trash | ✅ first version |
-| 4 | Duplicates (`diskwise dupes`), older versions, growth over time | ⏳ exact duplicate files done |
+| 4 | Duplicates (`diskwise dupes`, TUI tab, desktop section), older versions, growth over time | ⏳ duplicates done |
 | 5 | Optional local LLM to explain unrecognised folders | ⏳ |
 
 ## Usage
@@ -181,6 +181,23 @@ deletes nothing.
 - Files are compared by size, then their first and last 64 KB, then a full
   BLAKE3 hash. Full hashes are cached (`~/Library/Caches/diskwise`,
   `~/.cache/diskwise` on Linux), so reruns only read files that changed.
+- Copied **folders** are reported once, at their top, not as hundreds of files.
+- Each extra copy gets a suggested action you can change:
+  - **Trash**: a clear stray copy (next to the kept one as "copy", "(1)",
+    "_1", or left in Downloads while the kept one is elsewhere).
+  - **Store once**: when in doubt. The copy is replaced by a clone of the kept
+    one (APFS, btrfs, XFS): both paths keep working, the contents are stored
+    once, and the copy keeps its own tags, permissions and dates.
+  - **Keep as is**: remembered, for that copy or for a whole folder of
+    intentional duplicates.
+  - Copies in synced folders (Dropbox, Syncthing, Nextcloud…) are never
+    preselected: deleting there deletes on every device.
+- In the TUI (`diskwise tui`, tab 3) and the desktop app (Duplicates), you can
+  also keep a different copy ("always prefer this folder?") and carry out a
+  group's choices. Every step is checked again first: the copy must be
+  unchanged and still identical to the kept one.
+- Your choices are saved in `~/Library/Application Support/diskwise/duplicates.json`
+  (`~/.config/diskwise/` on Linux).
 
 ### Rules
 

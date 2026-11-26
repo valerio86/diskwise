@@ -756,6 +756,7 @@ function renderDupesTotals(progress) {
   }
   fill(
     $("dp-totals"),
+    d.notice ? h("p", { class: "warning", style: { flexBasis: "100%", margin: 0 } }, d.notice) : null,
     h("div", { class: "total" }, h("span", { class: "amount" }, bytes(d.reclaimable)), h("span", { class: "label" }, "reclaimable from duplicates")),
     h("div", { class: "total" }, h("span", { class: "amount" }, String(d.groups.length)), h("span", { class: "label" }, "groups of copies")),
     d.kept || d.shared
@@ -824,7 +825,7 @@ function renderDupeDetail() {
         "div",
         { class: "dp-copy-body" },
         h("p", { class: "dp-explain" }, c.explain),
-        c.synced ? h("p", { class: "dp-note" }, "In a synced folder: deleting it removes it on every synced device too.") : null,
+        c.synced && i > 0 ? h("p", { class: "dp-note" }, "In a synced folder: deleting it removes it on every synced device too.") : null,
         h(
           "div",
           { class: "dp-controls" },
@@ -975,8 +976,13 @@ function showDupePlan(id, plan) {
   dialog.returnValue = "";
   dialog.onclose = async () => {
     if (dialog.returnValue !== "go") return;
-    const result = await invoke("dupe_apply", { id });
-    toast(result.failures.length ? `${result.message} ${result.failures.join("; ")}` : result.message);
+    try {
+      // Exactly the steps shown: the Rust side refuses if the group changed since.
+      const result = await invoke("dupe_apply", { id, steps: plan.steps });
+      toast(result.failures.length ? `${result.message} ${result.failures.join("; ")}` : result.message);
+    } catch (e) {
+      toast(String(e));
+    }
     state.summary = await invoke("summary");
     if (state.current === null || !finding(state.current)) state.current = firstInOrder();
     renderDisk();

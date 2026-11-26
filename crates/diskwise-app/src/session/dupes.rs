@@ -81,6 +81,8 @@ pub struct DupesView {
     pub shared: usize,
     pub kept: usize,
     pub groups: Vec<GroupView>,
+    /// E.g. the saved choices couldn't be read.
+    pub notice: Option<String>,
 }
 
 /// What "Do it" would do for a group, or why it can't.
@@ -145,18 +147,20 @@ impl Session {
                     .map(|g| (false, 1, g.size, g.copies, g.reclaimable)),
             );
         self.dupe_groups = groups
-            .map(|(folder, files, size, copies, reclaimable)| GroupState {
-                id: copies
-                    .iter()
-                    .map(|c| c.path.as_str())
-                    .min()
-                    .unwrap_or("")
-                    .to_string(),
-                folder,
-                files,
-                size,
-                copies,
-                reclaimable,
+            .map(|(folder, files, size, mut copies, _)| {
+                // Put back what the user chose this session.
+                let id = dupes::group_id(&copies);
+                let reclaimable = self
+                    .choices
+                    .apply(&id, &mut copies, &self.prefs, &self.snap);
+                GroupState {
+                    id,
+                    folder,
+                    files,
+                    size,
+                    copies,
+                    reclaimable,
+                }
             })
             .collect();
         self.dupe_status = DupeStatus::Ready {
@@ -179,6 +183,7 @@ impl Session {
             shared,
             kept,
             groups: self.dupe_groups.iter().map(group_view).collect(),
+            notice: self.prefs_problem.clone(),
         }
     }
 
@@ -216,6 +221,7 @@ impl Session {
         let was = g.copies[i].action;
         g.copies[i].action = Some(action);
         g.reclaimable = dupes::reclaimable(&g.copies);
+        self.choices.set_action(path, action);
         if action == Action::Keep || was == Some(Action::Keep) {
             self.prefs.set_kept(path, action == Action::Keep);
             self.save_prefs()?;
@@ -241,7 +247,11 @@ impl Session {
             return Ok(KeeperResult { offer: None });
         }
         let previous = g.copies[0].path.clone();
-        g.reclaimable = dupes::set_keeper(&mut g.copies, i, &self.prefs, &self.snap);
+        self.choices.set_keeper(id, path);
+        // Swap, then put back the other copies' chosen actions where still valid.
+        g.reclaimable = self
+            .choices
+            .apply(id, &mut g.copies, &self.prefs, &self.snap);
         Ok(KeeperResult {
             offer: prefs::folder_pair(path, &previous)
                 .map(|(prefer, over)| FolderOffer { prefer, over }),
@@ -320,9 +330,20 @@ impl Session {
     pub fn dupe_apply(
         &mut self,
         id: &str,
+        confirmed: &[Step],
         trasher: &dyn Fn(&Path) -> Result<(), String>,
     ) -> TrashResult {
         let steps = match self.dupe_plan(id) {
+            // Only what the user saw and confirmed: the group may have been
+            // checked again (and its choices changed) while the dialog was open.
+            DupePlan::Confirm { steps, .. } if steps != confirmed => {
+                return TrashResult {
+                    moved: 0,
+                    bytes: 0,
+                    failures: vec!["This group changed after you confirmed (it was checked again). Look at it again and confirm.".into()],
+                    message: "Nothing was changed.".into(),
+                };
+            }
             DupePlan::Confirm { steps, .. } => steps,
             DupePlan::Refuse { body, .. } => {
                 return TrashResult {
@@ -337,14 +358,19 @@ impl Session {
         let mut failures = Vec::new();
         for s in &steps {
             match act::apply(&self.snap, &self.protection, &s.target, s.how, trasher) {
-                Ok(_) => {
+                Ok(done) => {
                     act::record(&mut self.snap, &s.target, s.how);
-                    if s.how == How::Trash {
-                        trashed += 1;
-                    } else {
-                        stored += 1;
+                    if done.freed_anything(s.how) {
+                        if s.how == How::Trash {
+                            trashed += 1;
+                        } else {
+                            stored += 1;
+                        }
+                        freed += s.bytes;
                     }
-                    freed += s.bytes;
+                    if let Some(e) = done.stopped {
+                        failures.push(e);
+                    }
                 }
                 Err(e) => failures.push(e),
             }
@@ -543,7 +569,11 @@ mod tests {
         };
         assert_eq!(steps.len(), 2);
         let fake = |p: &Path| std::fs::remove_file(p).map_err(|e| e.to_string());
-        let result = s.dupe_apply(&id, &fake);
+        // A plan other than the one shown is refused.
+        let refused = s.dupe_apply(&id, &steps[..1], &fake);
+        assert_eq!(refused.moved, 0);
+        assert!(d.join("Other/a.bin").exists());
+        let result = s.dupe_apply(&id, &steps, &fake);
         assert_eq!(result.moved, 2, "{:?}", result.failures);
         assert!(d.join("Docs/a.bin").exists());
         assert!(!d.join("Other/a.bin").exists());

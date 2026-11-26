@@ -31,12 +31,21 @@ pub struct Prefs {
 }
 
 impl Prefs {
-    /// The saved preferences, or the defaults if there are none (or they can't be read).
-    pub fn load(path: &Path) -> Self {
-        std::fs::read(path)
-            .ok()
-            .and_then(|b| serde_json::from_slice(&b).ok())
-            .unwrap_or_default()
+    /// The saved preferences; the defaults if there's no file yet. An error
+    /// if the file exists but can't be read or understood: callers then use
+    /// the defaults *without saving*, so a hand-edit mistake never wipes the
+    /// user's choices.
+    pub fn load(path: &Path) -> Result<Self, String> {
+        match std::fs::read(path) {
+            Ok(b) => serde_json::from_slice(&b).map_err(|e| {
+                format!(
+                    "Your saved duplicate choices in {} couldn't be read ({e}). They're left as they are and nothing will be saved over them; fix or remove the file.",
+                    path.display()
+                )
+            }),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(e) => Err(format!("Couldn't read {}: {e}", path.display())),
+        }
     }
 
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
@@ -56,9 +65,10 @@ impl Prefs {
         crate::platform::config_dir().map(|d| d.join("duplicates.json"))
     }
 
-    /// Whether `path` (an extra copy) should be kept as it is.
+    /// Whether `path` (an extra copy) should be kept as it is: it, or a folder
+    /// it's in, was kept, or it's in a folder of intentional duplicates.
     pub fn is_kept(&self, path: &str) -> bool {
-        self.keep.iter().any(|k| k == path)
+        self.keep.iter().any(|k| k == path || inside(path, k))
             || self
                 .intentional
                 .iter()
@@ -136,6 +146,11 @@ mod tests {
         let mut p = Prefs::default();
         p.set_intentional("/Users/v/Development/stilson-road", true);
         p.set_kept("/Users/v/Downloads/x.pdf", true);
+        p.set_kept("/Users/v/Downloads/P", true);
+        assert!(
+            p.is_kept("/Users/v/Downloads/P/sub/x.mov"),
+            "inside a kept folder copy"
+        );
         assert!(p.is_kept("/Users/v/Development/stilson-road/anim/web/a.mp4"));
         assert!(p.is_kept("/Users/v/Downloads/x.pdf"));
         assert!(!p.is_kept("/Users/v/Downloads/y.pdf"));
@@ -180,8 +195,14 @@ mod tests {
         };
         p.set_intentional("/Users/v/x", true);
         p.save(&path).unwrap();
-        assert_eq!(Prefs::load(&path), p);
-        assert_eq!(Prefs::load(&d.join("missing.json")), Prefs::default());
+        assert_eq!(Prefs::load(&path).unwrap(), p);
+        assert_eq!(
+            Prefs::load(&d.join("missing.json")).unwrap(),
+            Prefs::default()
+        );
+        // A broken file is an error, not silently the defaults.
+        std::fs::write(&path, b"{ \"keep\": [\"/x\",] }").unwrap();
+        assert!(Prefs::load(&path).is_err());
         std::fs::remove_dir_all(&d).unwrap();
     }
 }

@@ -590,6 +590,10 @@ fn assign_actions(copies: &mut [Copy], ctx: &Ctx) {
     let keeper_path = copies[0].path.clone();
     let keeper_dev = copies[0].dev;
     copies[0].action = None;
+    copies[0].synced = ctx
+        .synced
+        .iter()
+        .any(|s| keeper_path == *s || inside(&keeper_path, s));
     let keeper_in_downloads = in_downloads(&keeper_path, home_base);
     for c in &mut copies[1..] {
         let (dev, can_clone) = (&c.dev, &c.can_clone);
@@ -670,6 +674,56 @@ impl Action {
             Action::Keep => "Kept as it is, and remembered for next time.",
             Action::Nothing => "Already shares its storage with the kept copy: nothing to gain.",
         }
+    }
+}
+
+/// A stable name for a group while it's listed (its keeper can change).
+pub fn group_id(copies: &[Copy]) -> String {
+    copies
+        .iter()
+        .map(|c| c.path.as_str())
+        .min()
+        .unwrap_or("")
+        .to_string()
+}
+
+/// What the user chose in this session (keepers and per-copy actions), so a
+/// fresh check (after anything changes) doesn't throw the choices away.
+/// "Keep as is" is saved in `Prefs` instead.
+#[derive(Debug, Clone, Default)]
+pub struct Choices {
+    keepers: HashMap<String, String>,
+    actions: HashMap<String, Action>,
+}
+
+impl Choices {
+    pub fn set_action(&mut self, copy: &str, action: Action) {
+        self.actions.insert(copy.to_string(), action);
+    }
+
+    pub fn set_keeper(&mut self, group: &str, keeper: &str) {
+        self.keepers.insert(group.to_string(), keeper.to_string());
+        self.actions.remove(keeper);
+    }
+
+    /// Put the user's choices back on a group (from a fresh report, or after a
+    /// keeper swap reset its actions). Returns the group's reclaimable space.
+    pub fn apply(&self, group: &str, copies: &mut [Copy], prefs: &Prefs, snap: &Snapshot) -> u64 {
+        if let Some(k) = self.keepers.get(group)
+            && let Some(i) = copies.iter().position(|c| &c.path == k)
+            && i > 0
+        {
+            set_keeper(copies, i, prefs, snap);
+        }
+        for i in 1..copies.len() {
+            if let Some(&a) = self.actions.get(&copies[i].path)
+                && a != Action::Keep
+                && choices(&copies[0], &copies[i]).contains(&a)
+            {
+                copies[i].action = Some(a);
+            }
+        }
+        reclaimable(copies)
     }
 }
 
@@ -1232,6 +1286,64 @@ mod tests {
         assert_eq!(copies[1].path, before);
         assert!(copies[1].action.is_some());
         assert!(total > 0);
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn a_folder_kept_as_is_keeps_its_contents() {
+        let d = dir("keptfolder");
+        let a = content(14, 2 << 20);
+        write(&d.join("Docs/P/x.mov"), &a);
+        write(&d.join("Docs/P/sub/y.mov"), &content(15, 2 << 20));
+        write(&d.join("Docs/other.txt"), b"only here");
+        write(&d.join("Downloads/P/x.mov"), &a);
+        write(&d.join("Downloads/P/sub/y.mov"), &content(15, 2 << 20));
+        write(&d.join("Downloads/more.txt"), b"different");
+        let snap = scan(&d);
+        let p = |s: &str| d.join(s).display().to_string();
+        let mut prefs = Prefs::default();
+        prefs.set_kept(&p("Downloads/P"), true);
+        let r = find(&snap, None, None, &prefs);
+        let listed: Vec<&str> = r
+            .folders
+            .iter()
+            .flat_map(|g| &g.copies)
+            .chain(r.groups.iter().flat_map(|g| &g.copies))
+            .filter(|c| c.action.is_some_and(|a| a != Action::Keep))
+            .map(|c| c.path.as_str())
+            .collect();
+        assert!(
+            listed.iter().all(|c| !c.contains("/Downloads/P")),
+            "{listed:?}"
+        );
+        assert_eq!(r.kept_folders.len(), 1);
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn choices_survive_a_fresh_check() {
+        let d = dir("choices");
+        let a = content(16, 2 << 20);
+        write(&d.join("Docs/a.bin"), &a);
+        write(&d.join("Docs/notes.txt"), b"n");
+        write(&d.join("Other/a.bin"), &a);
+        write(&d.join("Other/more.txt"), b"m");
+        write(&d.join("Third/a.bin"), &a);
+        let snap = scan(&d);
+        let prefs = Prefs::default();
+        let first = find(&snap, None, None, &prefs);
+        let copies = &first.groups[0].copies;
+        let id = group_id(copies);
+        let (old_keeper, new_keeper) = (copies[0].path.clone(), copies[1].path.clone());
+        let mut choices = Choices::default();
+        choices.set_keeper(&id, &new_keeper);
+        choices.set_action(&old_keeper, Action::Trash);
+        // A fresh check comes back with defaults; the choices go back on.
+        let mut again = find(&snap, None, None, &prefs).groups[0].copies.clone();
+        choices.apply(&id, &mut again, &prefs, &snap);
+        assert_eq!(again[0].path, new_keeper);
+        let old = again.iter().find(|c| c.path == old_keeper).unwrap();
+        assert_eq!(old.action, Some(Action::Trash));
         std::fs::remove_dir_all(&d).unwrap();
     }
 

@@ -13,11 +13,11 @@ how to use it; this file covers how to work on it and what's next.
 | — | Linux support (CI on Ubuntu + macOS) | done |
 | 3a | Terminal UI `diskwise tui` | done |
 | 3b | Desktop app (Tauri 2), `crates/diskwise-app` | first version done |
-| 4 | Duplicates, older versions, growth ("correlation" findings) | **in progress**: exact file + folder dupes (core + CLI) done |
+| 4 | Duplicates, older versions, growth ("correlation" findings) | **in progress**: duplicates done in core, CLI, TUI and desktop (4.1, 4.2); 4.3 next |
 | 5 | Optional local LLM to explain unrecognised folders | planned below |
 
-Three code reviews have been done and every finding fixed (commits 1ad8f48,
-0b0d063, and the phase 4 review after 083586d). 79 tests; clippy clean on macOS, Linux and the app.
+Four code reviews have been done and every finding fixed (commits 1ad8f48,
+0b0d063, 5b46a11, and the 4.2 review after 92f8fc4). 100 tests; clippy clean on macOS, Linux and the app.
 
 ## Decisions already made (don't relitigate)
 
@@ -186,58 +186,77 @@ needs its own design, since it breaks the "only ever the Trash" model).
 - Storage-sharing probes (FIEMAP forces writeback on Linux) run only on
   final duplicate groups. Linux: an extent walk cut short counts as shared.
 
-### 4.2 next: the UIs and acting on duplicates
+### 4.2 UIs and acting on duplicates: done
 
-- **Near-duplicate folders** ("a copy that drifted", e.g. New FLC above):
-  later; report as Review with what differs.
-- **TUI and desktop**: a "Duplicates" group under Suggestions, filled in the
-  background after the scan (`DupeProgress` exists for a progress bar). Safety
-  at most "caution".
-- **Choosing the keeper**, least input first: (1) swap the keeper per group;
-  (2) on a swap, offer "always prefer folder A over folder B", saved in a small
-  preferences file and applied to every group with that pair of folders (copies
-  come in batches); (3) the `Prefer` setting (original / newest copy). After a
-  swap, actions are recomputed against the new keeper.
-- **Every extra copy offers every action that applies**; the suggested one is
-  only preselected (the user wants to keep some suggested-Trash copies, e.g. in
-  stilson-road). Actions: Move to Trash; Store once (same volume + clones);
-  **Keep as is**, remembered either for that file ("these copies are meant to
-  exist", keyed by content hash + paths) or for a whole folder ("duplicates in
-  `~/Development/stilson-road` are intentional": never suggest Trash there,
-  offer Store once or nothing). Saved in the same preferences file as the
-  folder-pair keeper choices, and respected by later scans.
-- **No symlink action** (decided): Store once gives the same result without
-  breaking when the keeper moves, without edits leaking between copies, and
-  without tools (git, zip, web servers) treating the path differently. A
-  cross-volume link is the only thing it can't do, and that breaks whenever
-  the drive is unplugged. Revisit only if a real case comes up.
-- **Synced folders** (Dropbox, Google Drive, OneDrive, iCloud Drive, Nextcloud,
-  Syncthing): deleting a copy there deletes it in the cloud and on every
-  device, and replacing it with a clone may re-upload it. Copies inside one
-  should never be preselected for Trash or Store once (Review, with that
-  warning). Detect by marker files (`.dropbox`, `.stfolder`, `.sync`,
-  `.owncloudsync.log`, `.sync_*.db`), not by folder names: the user's
-  `~/google-drive` is a plain old folder. Modern Google Drive/Dropbox/OneDrive
-  and iCloud Drive live under ~/Library (CloudStorage, Mobile Documents),
-  which is never collected. iCloud "Desktop & Documents" syncing would make
-  ~/Desktop and ~/Documents synced: check how to detect it.
-- **"Store once" action**: on the copy's volume, clone the keeper next to the
-  copy (`clonefile` on macOS, `FICLONE` on Linux), carry over the copy's own
-  metadata (permissions, owner, Finder tags and other xattrs, creation and
-  modification dates), check the clone hashes the same, then `rename` it over
-  the copy (atomic). Re-check the copy is unchanged right before. Never
-  symlinks or hard links (the user finds them heavy-handed, and hard links
-  make later edits show up in both).
-- **References to a trashed copy** aren't tracked in general (too hard to do
-  cleanly). Cheap safeguards only: it's the Trash (recoverable); warn if a
-  symlink in the scan points at the copy; warn when project or library files
-  sit nearby (e.g. a Lightroom catalog). "Store once" sidesteps the issue,
-  which is why it's the in-doubt default.
-- **Acting on duplicates needs a file-level trash check.** `check_trash` only
-  accepts nodes in the tree, and files under `min_node_size` (10 MB) are folded
-  into "(smaller items)". Add a check against the `LargeFile` record (same
-  size, mtime, inode; never the last remaining copy; re-hash before trashing),
-  keeping every other `Protection` rule.
+What's built (decisions in brackets were the user's):
+- **Core actions** (`dupes/act.rs`): `check` then `apply` per copy, Trash or
+  Store once, for files and folders. Checked right before acting: unchanged
+  since the scan (size/mtime/inode from `LargeFile`, which covers files under
+  `min_node_size` that `check_trash` can't), not protected, and **still
+  identical to the keeper** (re-hashed; folders re-compared entry by entry),
+  so the last copy of anything never goes. Store once = `clonefile`/`FICLONE`
+  the keeper to a temp name beside the copy, give it the copy's xattrs (Finder
+  tags), owner, mode, atime/mtime, creation date (macOS) and file flags,
+  verify the hash, `rename` over. Hard links and existing clones are skipped.
+  ACLs are not carried over. `record` keeps the snapshot and candidates in
+  step; `forget` does that for any other Trash move.
+- **Preferences** (`dupes/prefs.rs`, `~/Library/Application Support/diskwise/
+  duplicates.json` or `~/.config/diskwise/`): prefer original/newest, "always
+  keep copies in A over B" (folder_order, a score in `rank`), copies kept as
+  they are (`keep`), folders of intentional duplicates (`intentional`). Kept
+  copies get `Action::Keep`; groups with nothing left to do go to
+  `Report::kept`/`kept_folders`. The CLI's `--prefer` overrides the saved one.
+- **Synced folders**: the scan records folders holding a sync marker
+  (`.dropbox`, `.stfolder`, `.owncloudsync.log`, `.nextcloudsync.log`,
+  `.sync_*.db`) in `Snapshot::synced_roots`; copies inside are preselected
+  Review and flagged, with a warning if the user picks Trash.
+- **Shared UI logic in core**: `choices()` (what a copy can be switched to),
+  `set_keeper()` (swap and recompute actions), `act::plan()`/`GroupPlan`
+  (steps, undecided, warning), `Action::label()`/`explain()`.
+- **TUI**: a third tab, Duplicates (key 3; Tab/Shift-Tab cycle), filled in
+  the background after the scan with progress. ←→ picks a copy, space cycles
+  its action, p keeps it instead (then offers "always prefer this folder"),
+  i marks an intentional folder (chooser of nearest ancestors, never a home),
+  d carries out the group after a confirmation. Re-checked after any action.
+- **Desktop**: a third section with the Suggestions layout (groups left,
+  copies right with a Trash / Store once / Keep as is control per copy, Keep
+  this one instead, Show in Finder, Intentional…). Background check emits
+  `dupes-progress`/`dupes-done`; a generation counter drops results from an
+  older check. `dupe_apply` recomputes the plan on the Rust side (the UI isn't
+  trusted). Paths are shown exactly (`white-space: pre-wrap`); action label
+  colours are text-safe mixes of the validated safety colours.
+- Preview: `dev/preview.sh` takes `tab=dupes&dupe=N&live=1` plus `dupeplan=1`,
+  `intentional=1`, `offer=1`; the fixture now includes a duplicates view.
+
+4.2 review (2026-11-26), lessons:
+- **Confirm what was shown.** The desktop UI sends the confirmed steps to
+  `dupe_apply`, which refuses if the group's plan differs now (a background
+  re-check can replace a group while a dialog is open).
+- **Re-checks must not lose choices**: `dupes::Choices` (keepers and actions
+  chosen this session, keyed by `group_id`) is re-applied to each fresh report
+  and after a keeper swap, in both UIs.
+- **A kept folder keeps what's inside** (`Prefs::is_kept` matches inside kept
+  entries; kept folder copies are excluded like extra copies).
+- **Store once on odd files**: clear inherited flags and make the clone
+  writable first; set times with a read-only handle; mode, then flags, last.
+- **Never overwrite a preferences file that didn't parse** (`Prefs::load`
+  returns an error; the UIs then don't save, and say why).
+- Count only what was freed (`Done::freed_anything`); a folder's store once
+  that stops partway reports `Done::stopped` and is still recorded.
+
+Still open:
+- **Hands-on**: neither UI's Trash or Store once has been used on real files
+  by hand (tests use real files under target/test-tmp with a stand-in Trash;
+  store once is tested on real APFS). Try once on disposable copies.
+- **Undo for "keep as is" / intentional folders** exists only by editing
+  `duplicates.json` (the status line / toast says where). A small list of
+  remembered choices in each UI would be better.
+- **References to a trashed copy**: planned cheap warnings not built yet
+  (a symlink in the scan pointing at the copy; a Lightroom catalog nearby).
+- **iCloud "Desktop & Documents"** sync isn't detected (~/Desktop and
+  ~/Documents would then be synced folders). Find a reliable marker.
+- **Near-duplicate folders** ("a copy that drifted", e.g. New FLC): report
+  as Review with what differs.
 
 ### 4.3 later: older versions, growth
 

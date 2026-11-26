@@ -269,9 +269,16 @@ fn main() -> Result<()> {
                 PreferArg::Original => diskwise_core::dupes::Prefer::Original,
                 PreferArg::Newest => diskwise_core::dupes::Prefer::NewestCopy,
             });
-            let mut prefs = diskwise_core::dupes::Prefs::default_path()
+            let mut prefs = match diskwise_core::dupes::Prefs::default_path()
                 .map(|p| diskwise_core::dupes::Prefs::load(&p))
-                .unwrap_or_default();
+            {
+                Some(Ok(p)) => p,
+                Some(Err(e)) => {
+                    eprintln!("Note: {e}");
+                    Default::default()
+                }
+                None => Default::default(),
+            };
             if let Some(prefer) = prefer {
                 prefs.prefer = prefer;
             }

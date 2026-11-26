@@ -174,6 +174,11 @@ pub(crate) fn clone_file(src: &Path, dst: &Path) -> std::io::Result<()> {
 }
 
 /// Linux has no user-settable file flags worth carrying over here.
+pub(crate) fn clear_flags(_to: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// Linux has no user-settable file flags worth carrying over here.
 pub(crate) fn copy_flags(_from: &std::fs::Metadata, _to: &Path) -> std::io::Result<()> {
     Ok(())
 }

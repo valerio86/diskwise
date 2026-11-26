@@ -180,6 +180,13 @@ pub(super) fn find(
         let reclaimable = reclaimable(&copies);
         if reclaimable == 0 {
             if copies[1..].iter().any(|c| c.action == Some(Action::Keep)) {
+                // What's inside a folder kept as it is isn't suggested either.
+                extras.extend(
+                    copies[1..]
+                        .iter()
+                        .filter(|c| c.action == Some(Action::Keep))
+                        .map(|c| c.path.clone()),
+                );
                 kept_out.push(FolderGroup {
                     size,
                     files,

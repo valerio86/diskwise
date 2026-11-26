@@ -12,6 +12,8 @@ use super::{App, Modal, ancestors, step};
 /// A duplicated folder or file, as listed in the tab.
 #[derive(Debug, Clone)]
 pub struct DupeGroup {
+    /// Stable while listed (see `dupes::group_id`).
+    pub id: String,
     pub folder: bool,
     /// Files in one copy (1 for a file).
     pub files: u64,
@@ -92,32 +94,39 @@ impl App {
 
     pub fn set_dupes(&mut self, r: dupes::Report) {
         // Keep the selection on the same group if it's still there.
-        let selected = self.selected_group().map(|g| g.copies[0].path.clone());
+        let selected = self.selected_group().map(|g| g.id.clone());
         let mut groups: Vec<DupeGroup> = r
             .folders
             .into_iter()
-            .map(|g| DupeGroup {
-                folder: true,
-                files: g.files,
-                size: g.size,
-                copies: g.copies,
-                reclaimable: g.reclaimable,
+            .map(|g| (true, g.files, g.size, g.copies))
+            .chain(r.groups.into_iter().map(|g| (false, 1, g.size, g.copies)))
+            .map(|(folder, files, size, mut copies)| {
+                // Put back what the user chose this session.
+                let id = dupes::group_id(&copies);
+                let reclaimable = self
+                    .choices
+                    .apply(&id, &mut copies, &self.prefs, &self.snap);
+                DupeGroup {
+                    id,
+                    folder,
+                    files,
+                    size,
+                    copies,
+                    reclaimable,
+                }
             })
             .collect();
-        groups.extend(r.groups.into_iter().map(|g| DupeGroup {
-            folder: false,
-            files: 1,
-            size: g.size,
-            copies: g.copies,
-            reclaimable: g.reclaimable,
-        }));
+        // Groups whose last extra copy was kept as it is can drop to nothing.
+        groups.retain(|g| {
+            g.reclaimable > 0 || g.copies[1..].iter().any(|c| c.action != Some(Action::Keep))
+        });
         self.dupe_groups = groups;
         self.dupe_state = DupeState::Ready {
             shared: r.already_shared.len(),
             kept: r.kept.len() + r.kept_folders.len(),
         };
         self.dupe_sel = selected
-            .and_then(|p| self.dupe_groups.iter().position(|g| g.copies[0].path == p))
+            .and_then(|id| self.dupe_groups.iter().position(|g| g.id == id))
             .unwrap_or(0)
             .min(self.dupe_groups.len().saturating_sub(1));
         self.copy_sel = 0;
@@ -172,6 +181,7 @@ impl App {
             None => options[0],
         };
         let path = copy.path.clone();
+        self.choices.set_action(&path, next);
         let g = &mut self.dupe_groups[sel];
         g.copies[i].action = Some(next);
         g.reclaimable = dupes::reclaimable(&g.copies);
@@ -193,9 +203,14 @@ impl App {
             return;
         }
         let previous = self.dupe_groups[sel].copies[0].path.clone();
+        let chosen = self.dupe_groups[sel].copies[i].path.clone();
+        let id = self.dupe_groups[sel].id.clone();
+        self.choices.set_keeper(&id, &chosen);
+        // Swap, then put back the other copies' chosen actions where still valid.
         let g = &mut self.dupe_groups[sel];
-        g.reclaimable = dupes::set_keeper(&mut g.copies, i, &self.prefs, &self.snap);
-        let chosen = g.copies[0].path.clone();
+        g.reclaimable = self
+            .choices
+            .apply(&id, &mut g.copies, &self.prefs, &self.snap);
         self.copy_sel = 0;
         self.modal = prefs::folder_pair(&chosen, &previous)
             .map(|(prefer, over)| Modal::PreferFolder { prefer, over });
@@ -312,16 +327,23 @@ impl App {
                 item.how,
                 &trasher,
             ) {
-                Ok(_) => {
+                Ok(done) => {
                     if item.how == How::Trash {
                         self.remove_from_tree(&item.target.copy);
                         self.remove_from_findings(&item.target.copy, item.bytes);
-                        trashed += 1;
-                    } else {
-                        stored += 1;
                     }
                     act::record(&mut self.snap, &item.target, item.how);
-                    freed += item.bytes;
+                    if done.freed_anything(item.how) {
+                        if item.how == How::Trash {
+                            trashed += 1;
+                        } else {
+                            stored += 1;
+                        }
+                        freed += item.bytes;
+                    }
+                    if let Some(e) = done.stopped {
+                        failures.push(e);
+                    }
                 }
                 Err(e) => failures.push(e),
             }
