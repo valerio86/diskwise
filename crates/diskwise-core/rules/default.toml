@@ -392,18 +392,65 @@ how = "Keep these if you use git, Homebrew, or build software."
 
 # ── Your files (generic; keep these last) ──────────────────────────────────
 
+# Installers are split by where macOS recorded them as downloaded from
+# (com.apple.metadata:kMDItemWhereFroms). Store purchases come first: if the store
+# or developer disappears, the installer can't be downloaded again.
+
 [[rule]]
-id = "downloaded-installers"
-title = "Installers in Downloads"
+id = "installer-purchased"
+title = "Purchased installers in Downloads"
+match = ["~/Downloads/**/*.{dmg,pkg,mpkg,iso,xip,zip}"]
+kind = "file"
+min_size = "20M"
+from = [
+  "humble.com", "humblebundle.com", "gog.com", "gogalaxy.com", "gog-statics.com",
+  "itch.io", "itch.zone", "gumroad.com", "bandcamp.com", "fastspring.com",
+  "paddle.com", "paddle.net", "lemonsqueezy.com", "sellfy.com", "payhip.com",
+  "sendowl.com", "kagi.com", "devmate.com", "bundlehunt.com", "stacksocial.com",
+]
+category = "installer"
+safety = "review"
+action = "archive"
+why = "Downloaded from a store you buy software from. If the store, the developer, or your account goes away, you may not be able to download it again."
+how = "Keep a copy on backup or cloud storage, then delete it here. Keep the store's receipt or license key with it."
+
+[[rule]]
+id = "installer-vendor"
+title = "Installers from major vendors"
+match = ["~/Downloads/**/*.{dmg,pkg,mpkg,iso,xip}"]
+kind = "file"
+min_size = "20M"
+older_than_days = 14
+from = [
+  "apple.com", "google.com", "mozilla.org", "mozilla.net", "microsoft.com", "office.com",
+  "adobe.com", "zoom.us", "slack.com", "slack-edge.com", "dropbox.com", "docker.com",
+  "epicgames.com", "unrealengine.com", "steampowered.com", "spotify.com",
+  "whatsapp.com", "whatsapp.net", "1password.com", "agilebits.com", "brave.com",
+  "signal.org", "telegram.org", "discord.com", "discordapp.net", "notion.so",
+  "figma.com", "jetbrains.com", "visualstudio.com", "python.org", "nodejs.org",
+  "videolan.org", "blender.org", "libreoffice.org", "gimp.org", "ubuntu.com",
+  "debian.org", "raspberrypi.com", "anthropic.com", "claude.ai", "openai.com",
+  "epson.com", "canon.com", "hp.com", "brother.com", "logitech.com", "garmin.com",
+  "nvidia.com", "github.com", "githubusercontent.com", "sourceforge.net", "fosshub.com",
+]
+category = "installer"
+safety = "safe"
+action = "trash"
+why = "An installer from a large vendor that keeps its downloads available. You can get the current version again from their site."
+how = "Move to the Trash. If you rely on this exact version (e.g. a driver for old hardware), keep a copy instead."
+
+[[rule]]
+id = "installer-unknown-source"
+title = "Installers of unknown origin"
 match = ["~/Downloads/**/*.{dmg,pkg,mpkg,iso,xip}"]
 kind = "file"
 min_size = "20M"
 older_than_days = 14
 category = "installer"
-safety = "safe"
+safety = "caution"
 action = "trash"
-why = "App installers and disk images. Once the app is installed you can download the installer again if you ever need it."
-how = "Move to the Trash."
+why = "An installer from a site diskwise doesn't recognise, or with no recorded source. It may be free and easy to download again, or a paid app from a small developer that might not be around later."
+how = "Free app from a well-known site: move to the Trash. Paid app or small developer: back it up first."
 
 [[rule]]
 id = "downloaded-archives"

@@ -1,6 +1,7 @@
 //! diskwise core: scan a disk into a size tree and collect macOS storage facts.
 
 pub mod model;
+pub mod provenance;
 pub mod rules;
 pub mod scan;
 pub mod suggest;

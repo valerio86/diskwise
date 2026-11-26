@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::model::{Node, NodeKind};
 use crate::parse_size;
+use crate::provenance::{download_hosts, host_matches};
 
 /// Rules shipped with diskwise.
 pub const BUILTIN_RULES: &str = include_str!("../rules/default.toml");
@@ -112,6 +113,9 @@ pub struct RuleDef {
     pub min_size: Option<String>,
     pub older_than_days: Option<u32>,
     pub sibling: Option<String>,
+    /// Only files macOS recorded as downloaded from one of these domains (or subdomains).
+    #[serde(default)]
+    pub from: Vec<String>,
     pub category: Category,
     pub safety: Safety,
     pub action: Action,
@@ -234,6 +238,13 @@ impl Rule {
                     .parent()
                     .is_some_and(|dir| dir.join(s).exists())
             })
+            && (self.def.from.is_empty() || self.downloaded_from_listed_domain(path))
+    }
+
+    fn downloaded_from_listed_domain(&self, path: &str) -> bool {
+        download_hosts(Path::new(path))
+            .iter()
+            .any(|h| self.def.from.iter().any(|d| host_matches(h, d)))
     }
 }
 
@@ -322,10 +333,10 @@ mod tests {
 
         // Fresh installer: too new for either Downloads rule.
         assert_eq!(id(&node(NodeKind::File, 300 << 20, now - DAY)), None);
-        // Month-old installer.
+        // Month-old installer with no recorded source.
         assert_eq!(
             id(&node(NodeKind::File, 300 << 20, now - 30 * DAY)).as_deref(),
-            Some("downloaded-installers")
+            Some("installer-unknown-source")
         );
         // Compressed data is not an "installer": it goes to review.
         let archive = node(NodeKind::File, 200 << 20, now - 60 * DAY);
@@ -376,6 +387,69 @@ mod tests {
         std::fs::write(dir.join("Cargo.toml"), "").unwrap();
         assert!(rs.rule_for(&target, &n, 0).is_some());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn installers_split_by_download_source() {
+        use crate::provenance::set_download_urls;
+        let now = 1_800_000_000;
+        // The download source is read from the real file, so point the built-in
+        // ~/Downloads rules at a temporary folder and create real files there.
+        let downloads = std::env::temp_dir().join(format!("diskwise-dl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&downloads);
+        std::fs::create_dir_all(&downloads).unwrap();
+        let rerooted = BUILTIN_RULES.replace("~/Downloads", &downloads.display().to_string());
+        let rs = RuleSet::from_sources(&[("rerooted", rerooted.as_str())]).unwrap();
+
+        let rule_for = |name: &str, urls: &[&str]| -> String {
+            let f = downloads.join(name);
+            std::fs::write(&f, b"x").unwrap();
+            if !urls.is_empty() {
+                set_download_urls(&f, urls);
+            }
+            let n = node(NodeKind::File, 300 << 20, now - 30 * DAY);
+            rs.rule_for(&f.display().to_string(), &n, now)
+                .map(|(_, r)| r.def.id.clone())
+                .unwrap_or_default()
+        };
+
+        assert_eq!(
+            rule_for(
+                "Game.dmg",
+                &[
+                    "https://dl.humble.com/g/Game.dmg?gamekey=K",
+                    "https://www.humblebundle.com/downloads"
+                ]
+            ),
+            "installer-purchased"
+        );
+        assert_eq!(
+            rule_for(
+                "Chrome.dmg",
+                &["https://dl.google.com/chrome/googlechrome.dmg"]
+            ),
+            "installer-vendor"
+        );
+        // A CDN host doesn't match, but the referring page does.
+        assert_eq!(
+            rule_for(
+                "Epic.dmg",
+                &[
+                    "https://epicgames-download1.akamaized.net/x.dmg",
+                    "https://www.unrealengine.com/"
+                ]
+            ),
+            "installer-vendor"
+        );
+        assert_eq!(rule_for("Mystery.dmg", &[]), "installer-unknown-source");
+        assert_eq!(
+            rule_for(
+                "Indie.dmg",
+                &["https://downloads.tinystudio.example/indie.dmg"]
+            ),
+            "installer-unknown-source"
+        );
+        std::fs::remove_dir_all(&downloads).unwrap();
     }
 
     #[test]

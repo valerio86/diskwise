@@ -1,10 +1,12 @@
 //! Turn a snapshot into findings: rule matches on the tree plus system-level checks.
 
 use std::collections::HashMap;
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
 use crate::model::{Node, NodeKind, Snapshot};
+use crate::provenance::download_hosts;
 use crate::rules::{Action, Category, RuleSet, Safety};
 use crate::{DEFAULT_ROOT, human_bytes};
 
@@ -21,6 +23,10 @@ pub struct Item {
     pub bytes: u64,
     pub newest_mtime: i64,
     pub is_dir: bool,
+    /// Host the file was downloaded from, if macOS recorded one. Never the full URL,
+    /// which can contain purchase keys.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -96,6 +102,11 @@ fn walk(node: &Node, path: &str, rules: &RuleSet, now: i64, out: &mut HashMap<us
         let child_path = join(path, &child.name);
         match rules.rule_for(&child_path, child, now) {
             Some((idx, rule)) => {
+                let source = if child.kind == NodeKind::File {
+                    download_hosts(Path::new(&child_path)).into_iter().next()
+                } else {
+                    None
+                };
                 let d = &rule.def;
                 let f = out.entry(idx).or_insert_with(|| Finding {
                     id: d.id.clone(),
@@ -116,6 +127,7 @@ fn walk(node: &Node, path: &str, rules: &RuleSet, now: i64, out: &mut HashMap<us
                     bytes: child.allocated,
                     newest_mtime: child.newest_mtime,
                     is_dir: child.kind == NodeKind::Dir,
+                    source,
                 });
             }
             None => walk(child, &child_path, rules, now, out),
@@ -348,7 +360,7 @@ mod tests {
             get("adobe-installer-leftovers").unwrap().items[0].path,
             "/.adobeTemp"
         );
-        assert!(get("downloaded-installers").is_some());
+        assert!(get("installer-unknown-source").is_some());
         assert!(get("preboot-large").is_some());
         assert!(get("local-snapshots").is_some_and(|f| !f.size_known));
         // Tree is ~5.6 GB, Data volume uses 20 GB → gap reported.

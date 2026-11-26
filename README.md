@@ -64,6 +64,13 @@ and are compiled into the binary. A rule matches absolute paths with globs (`~/`
 `older_than_days`, `sibling` (e.g. only `target/` next to a `Cargo.toml`). The
 first matching rule claims a path, so specific rules come before generic ones.
 
+Rules can also use `from = ["domain", …]`, which matches files macOS recorded
+as downloaded from those domains (the `kMDItemWhereFroms` attribute). This is
+how installers are split: bought from a store (Humble, GOG, itch.io, …) →
+back it up first, since it may not be downloadable later; from a major vendor →
+safe to trash; unknown → check first. Only host names are read and shown: the
+recorded URLs can contain purchase keys.
+
 Add your own with `--rules my-rules.toml`: they take priority, and a rule with
 the same `id` as a built-in one replaces it.
 

@@ -5,6 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use diskwise_core::rules::{BUILTIN_RULES, Safety};
+use diskwise_core::suggest::Item;
 use diskwise_core::{
     DEFAULT_ROOT, Finding, Node, NodeKind, RuleSet, ScanOptions, Snapshot, human_bytes, parse_size,
 };
@@ -201,6 +202,14 @@ fn print_totals(findings: &[Finding]) {
     );
 }
 
+/// "  (from dl.humble.com)" when macOS recorded where the file was downloaded from.
+fn from_note(item: &Item) -> String {
+    item.source
+        .as_ref()
+        .map(|h| format!("  (from {h})"))
+        .unwrap_or_default()
+}
+
 fn size_label(f: &Finding) -> String {
     if f.size_known {
         human_bytes(f.bytes)
@@ -239,8 +248,13 @@ fn print_findings_compact(findings: &[Finding]) {
         for f in group {
             let location = match f.items.as_slice() {
                 [] => String::new(),
-                [one] => tilde(&one.path),
-                [first, rest @ ..] => format!("{} (+{} more)", tilde(&first.path), rest.len()),
+                [one] => format!("{}{}", tilde(&one.path), from_note(one)),
+                [first, rest @ ..] => format!(
+                    "{}{} (+{} more)",
+                    tilde(&first.path),
+                    from_note(first),
+                    rest.len()
+                ),
             };
             let line = format!(
                 "{:>9}  {:<title_w$}  {:<action_w$}  {location}",
@@ -274,7 +288,12 @@ fn print_findings(findings: &[Finding], max_items: usize) {
                 print_wrapped("Prevent: ", p);
             }
             for item in f.items.iter().take(max_items) {
-                println!("           {:>9}  {}", human_bytes(item.bytes), item.path);
+                println!(
+                    "           {:>9}  {}{}",
+                    human_bytes(item.bytes),
+                    item.path,
+                    from_note(item)
+                );
             }
             if f.items.len() > max_items {
                 let rest: u64 = f.items[max_items..].iter().map(|i| i.bytes).sum();
