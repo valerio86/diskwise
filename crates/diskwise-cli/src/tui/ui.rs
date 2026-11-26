@@ -114,12 +114,12 @@ fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
         Line::from(vec![
             Span::styled(" diskwise ", accent().bold()),
             Span::raw("  "),
-            tab("Browse".into(), app.tab == Tab::Browse),
-            Span::raw("  "),
             tab(
                 format!("Suggestions · {}", app.findings.len()),
                 app.tab == Tab::Suggestions,
             ),
+            Span::raw("  "),
+            tab("Browse".into(), app.tab == Tab::Browse),
             Span::styled("   tab to switch", muted()),
         ]),
         left,
@@ -541,7 +541,7 @@ fn draw_modal(f: &mut Frame, modal: &Modal) {
             (
                 "Keys".to_string(),
                 Text::from(vec![
-                    row("tab  1  2", "switch between Browse and Suggestions"),
+                    row("tab  1  2", "switch between Suggestions and Browse"),
                     row("↑ ↓  j k", "move (PgUp / PgDn move faster)"),
                     row("⏎ → l", "open folder · show suggestion in the browser"),
                     row("← h ⌫", "up one folder"),

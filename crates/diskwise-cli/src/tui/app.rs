@@ -101,7 +101,8 @@ impl App {
             cleanable_below: HashMap::new(),
             cwd: Vec::new(),
             selected: 0,
-            tab: Tab::Browse,
+            // Open on what to clean up; the browser is one key away.
+            tab: Tab::Suggestions,
             suggestion: 0,
             sort: SortBy::Size,
             modal: None,
@@ -703,8 +704,14 @@ mod tests {
     }
 
     #[test]
+    fn opens_on_suggestions() {
+        assert_eq!(app_at("/r").tab, Tab::Suggestions);
+    }
+
+    #[test]
     fn navigation_and_coverage() {
         let mut app = app_at("/r");
+        app.tab = Tab::Browse;
         assert_eq!(app.current_path(), "/r");
         app.open(); // home
         app.open(); // v
@@ -724,7 +731,6 @@ mod tests {
     #[test]
     fn suggestion_jumps_to_item() {
         let mut app = app_at("/r");
-        app.toggle_tab();
         app.suggestion = 1; // docs
         app.open();
         assert_eq!(app.tab, Tab::Browse);

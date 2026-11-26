@@ -35,12 +35,12 @@ cargo build --release
 `diskwise tui` scans (with live progress) and opens an `ncdu`-style browser that
 works locally or over SSH:
 
-- **Browse**: folders by size with bars. Items a suggestion covers are tagged
+- **Suggestions** (opens here; `1`): the `suggest` list; Enter jumps to the item in the
+  browser.
+- **Browse** (Tab or `2`): folders by size with bars. Items a suggestion covers are tagged
   and colour-coded (green safe, yellow caution, cyan review); folders show how
   much is cleanable inside them. The details pane says what an item is and how
   to clear it.
-- **Suggestions** (Tab): the `suggest` list; Enter jumps to the item in the
-  browser.
 - **Move to Trash** (`d`): always asks first, showing the exact paths, total,
   and any caution. Never deletes outright. Items that should be cleared inside
   their app, need an admin password, or only explain space get instructions
