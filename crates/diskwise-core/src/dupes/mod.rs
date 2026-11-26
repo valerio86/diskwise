@@ -33,6 +33,9 @@ use crate::model::{LargeFile, Snapshot};
 /// Smaller files rarely add up to much, and there are far more of them.
 pub const DEFAULT_MIN_SIZE: u64 = 1 << 20;
 
+mod folders;
+pub use folders::FolderGroup;
+
 /// Folders whose files belong to an app or tool, wherever they appear. Deleting
 /// one "duplicate" inside them breaks the thing that owns it, and the rules
 /// already say how to clear the ones that are caches.
@@ -205,6 +208,10 @@ pub struct Group {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Report {
+    /// Folders with identical contents, most reclaimable first. Files inside
+    /// their extra copies aren't listed again in `groups`.
+    #[serde(default)]
+    pub folders: Vec<FolderGroup>,
     /// Groups that free space, most reclaimable first.
     pub groups: Vec<Group>,
     /// Duplicates whose copies already share storage, so deleting frees nothing.
@@ -219,7 +226,8 @@ pub struct Report {
 
 impl Report {
     pub fn reclaimable(&self) -> u64 {
-        self.groups.iter().map(|g| g.reclaimable).sum()
+        self.folders.iter().map(|g| g.reclaimable).sum::<u64>()
+            + self.groups.iter().map(|g| g.reclaimable).sum::<u64>()
     }
 }
 
@@ -341,6 +349,17 @@ pub fn find(
         cached.save(path);
     }
 
+    report.folders = folders::find(snap, &by_hash, prefer);
+    // Files inside an extra folder copy are covered by that folder.
+    let extras: Vec<&str> = report
+        .folders
+        .iter()
+        .flat_map(|g| g.copies[1..].iter().map(|c| c.path.as_str()))
+        .collect();
+    for copies in by_hash.values_mut() {
+        copies.retain(|l| !extras.iter().any(|e| inside(&l.file.path, e)));
+    }
+
     for (hash, copies) in by_hash {
         if copies.len() < 2 {
             continue;
@@ -361,6 +380,11 @@ pub fn find(
     report
 }
 
+/// Whether display path `path` is strictly inside folder `dir`.
+fn inside(path: &str, dir: &str) -> bool {
+    path.strip_prefix(dir).is_some_and(|r| r.starts_with('/'))
+}
+
 /// Split `group` by `key`, dropping items without one and subgroups of one.
 fn split_by<F>(group: Vec<Live>, key: F) -> Vec<Vec<Live>>
 where
@@ -377,7 +401,7 @@ where
 
 fn build_group(hash: String, live: Vec<Live>, prefer: Prefer, home_base: &str) -> Group {
     let size = live[0].file.size;
-    let mut copies: Vec<(Copy, u64, bool)> = live
+    let copies: Vec<(Copy, u64, bool)> = live
         .into_iter()
         .map(|l| {
             let (frees, shared) = if l.file.nlink > 1 {
@@ -401,6 +425,21 @@ fn build_group(hash: String, live: Vec<Live>, prefer: Prefer, home_base: &str) -
             (copy, l.file.dev, l.can_clone)
         })
         .collect();
+    let copies = rank(copies, prefer, home_base);
+    // Other names of a hard-linked file already count as freeing nothing (and
+    // deleting every name of one would free it once: underestimated, never over).
+    let reclaimable = copies[1..].iter().map(|c| c.frees).sum();
+    Group {
+        size,
+        hash,
+        copies,
+        reclaimable,
+    }
+}
+
+/// Order copies (keeper first) and set each extra copy's action. Each entry is
+/// (copy, device, whether its filesystem can clone). Shared by files and folders.
+fn rank(mut copies: Vec<(Copy, u64, bool)>, prefer: Prefer, home_base: &str) -> Vec<Copy> {
     // A copy named like another one plus a marker ("a-1" next to "a") is never
     // the keeper while the plain name is there.
     let marked: HashSet<String> = copies
@@ -436,16 +475,7 @@ fn build_group(hash: String, live: Vec<Live>, prefer: Prefer, home_base: &str) -
             Action::Review
         });
     }
-    let copies: Vec<Copy> = copies.into_iter().map(|(c, _, _)| c).collect();
-    // Other names of a hard-linked file already count as freeing nothing (and
-    // deleting every name of one would free it once: underestimated, never over).
-    let reclaimable = copies[1..].iter().map(|c| c.frees).sum();
-    Group {
-        size,
-        hash,
-        copies,
-        reclaimable,
-    }
+    copies.into_iter().map(|(c, _, _)| c).collect()
 }
 
 /// Which copy to keep: the one in the most deliberate place, then the original

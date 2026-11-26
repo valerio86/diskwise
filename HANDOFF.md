@@ -13,11 +13,11 @@ how to use it; this file covers how to work on it and what's next.
 | — | Linux support (CI on Ubuntu + macOS) | done |
 | 3a | Terminal UI `diskwise tui` | done |
 | 3b | Desktop app (Tauri 2), `crates/diskwise-app` | first version done |
-| 4 | Duplicates, older versions, growth ("correlation" findings) | **in progress**: 4.1 core + CLI done |
+| 4 | Duplicates, older versions, growth ("correlation" findings) | **in progress**: exact file + folder dupes (core + CLI) done |
 | 5 | Optional local LLM to explain unrecognised folders | planned below |
 
 Two full code reviews have been done and every finding fixed (commits 1ad8f48,
-0b0d063). 70 tests; clippy clean on macOS, Linux and the app.
+0b0d063). 74 tests; clippy clean on macOS, Linux and the app.
 
 ## Decisions already made (don't relitigate)
 
@@ -153,14 +153,29 @@ needs its own design, since it breaks the "only ever the Trash" model).
   `--no-cache`, `--prefer original|newest`). On the user's home: 2.4 GB in 394 groups, ~5 s; reruns use the
   cache for hashing (the scan dominates).
 
-### 4.2 next: duplicate folders, then the UIs
+### Duplicate folders: done (`crates/diskwise-core/src/dupes/folders.rs`)
 
-- **Duplicate folders**: fingerprint each folder bottom-up from its files'
-  (name, size, hash) and report the *top* duplicated folder, not 4,000 files
-  inside it (real case: `~/Downloads/New FLC` is a copy of
-  `~/Documents/New FLC`). Then near-duplicates (≥ 90% same: "a copy that
-  drifted"). Small files inside such folders matter here, so `large_files`
-  may need to cover them; measure the snapshot size first.
+- Candidates come from duplicate files: step up both paths together while the
+  names below match, stopping at the scan root, homes and protected folders.
+  The scan's totals rule most pairs out (1% / 64 KB slack, a few files, for
+  `.DS_Store`); the rest are verified **exactly** by walking both folders
+  (names, kinds, sizes, symlink targets, contents; known hashes reused).
+  Ignored: `.DS_Store`, `._*`, `Icon\r`, `.localized`, `Thumbs.db`,
+  `desktop.ini`. Folders with odd entries (sockets, non-UTF-8 names) or more
+  than 200k entries are never matched.
+- Shallowest first; pairs inside an identical pair aren't checked again, and
+  groups of 3+ copies are joined. Only the top folder is reported, and files
+  inside an extra folder copy are dropped from the file groups (no double
+  counting). Keeper and actions use the same `rank()` as files.
+- On the user's home: 12 folders. Real limit: `~/Downloads/New FLC` vs
+  `~/Documents/New FLC` isn't identical (some subfolders were renamed, e.g.
+  "Poor craftsmanship - incomplete work" → "…   incomplete work"), so its
+  identical subfolders are reported one by one.
+
+### 4.2 next: the UIs and acting on duplicates
+
+- **Near-duplicate folders** ("a copy that drifted", e.g. New FLC above):
+  later; report as Review with what differs.
 - **TUI and desktop**: a "Duplicates" group under Suggestions, filled in the
   background after the scan (`DupeProgress` exists for a progress bar). Safety
   at most "caution".

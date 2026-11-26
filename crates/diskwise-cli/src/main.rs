@@ -312,25 +312,55 @@ fn load_rules(platform: &Platform, user: Option<&Path>) -> Result<RuleSet> {
 
 fn print_dupes(r: &diskwise_core::dupes::Report, top: usize) {
     use diskwise_core::dupes::{Action, Shared};
-    if r.groups.is_empty() {
+    let mark = |i: usize, action: Option<Action>| match (i, action) {
+        (0, _) => "keep",
+        (_, Some(Action::Trash)) => "trash",
+        (_, Some(Action::StoreOnce)) => "store once",
+        (_, Some(Action::Review)) => "review",
+        (_, Some(Action::Nothing) | None) => "",
+    };
+    if r.groups.is_empty() && r.folders.is_empty() {
         println!("No duplicates that would free space.");
     } else {
-        let copies: usize = r.groups.iter().map(|g| g.copies.len() - 1).sum();
+        let files: usize = r.groups.iter().map(|g| g.copies.len() - 1).sum();
+        let folders: usize = r.folders.iter().map(|g| g.copies.len() - 1).sum();
         println!(
-            "{} reclaimable: {} extra copies of {} files.",
+            "{} reclaimable: {} extra folder copies, {} extra file copies.",
             human_bytes(r.reclaimable()),
-            copies,
-            r.groups.len()
+            folders,
+            files
         );
         println!("The first path of each group is the suggested one to keep. For the others:");
         println!(
-            "  trash       a stray copy next to it (\"copy\", \"(1)\", \"_1\"): move to the Trash"
+            "  trash       a stray copy: next to it as \"copy\", \"(1)\", \"_1\", or left in Downloads"
         );
         println!(
-            "  store once  same name elsewhere, something may refer to it: replace with a clone,"
+            "  store once  in doubt, something may refer to it: replace with a clone, so both"
         );
-        println!("              so both paths keep working and the contents are stored once");
+        println!("              paths keep working and the contents are stored once");
         println!("  review      in doubt, and a clone isn't possible here: your call\n");
+    }
+    if !r.folders.is_empty() {
+        println!("Folders");
+        for g in r.folders.iter().take(top) {
+            println!(
+                "{:>9}  {} copies of a folder of {} files, {}",
+                human_bytes(g.reclaimable),
+                g.copies.len(),
+                g.files,
+                human_bytes(g.size)
+            );
+            for (i, c) in g.copies.iter().enumerate() {
+                println!("    {:>10}  {}/", mark(i, c.action), c.path);
+            }
+        }
+        if r.folders.len() > top {
+            println!(
+                "… and {} more folders (--top to see more).",
+                r.folders.len() - top
+            );
+        }
+        println!("\nFiles");
     }
     for g in r.groups.iter().take(top) {
         println!(
@@ -340,13 +370,7 @@ fn print_dupes(r: &diskwise_core::dupes::Report, top: usize) {
             human_bytes(g.size)
         );
         for (i, c) in g.copies.iter().enumerate() {
-            let mark = match (i, c.action) {
-                (0, _) => "keep",
-                (_, Some(Action::Trash)) => "trash",
-                (_, Some(Action::StoreOnce)) => "store once",
-                (_, Some(Action::Review)) => "review",
-                (_, Some(Action::Nothing) | None) => "",
-            };
+            let mark = mark(i, c.action);
             let note = match c.shared {
                 Some(Shared::HardLink) => "  (hard link: frees nothing)",
                 Some(Shared::Clone) if c.frees == 0 => "  (clone: frees nothing)",

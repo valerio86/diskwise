@@ -297,7 +297,7 @@ fn scan_dir(
 }
 
 /// Creation time in Unix seconds, or 0 if the filesystem doesn't record one.
-fn birth_time(meta: &Metadata) -> i64 {
+pub(crate) fn birth_time(meta: &Metadata) -> i64 {
     meta.created()
         .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
