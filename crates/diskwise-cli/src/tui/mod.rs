@@ -23,6 +23,8 @@ pub struct Options {
     pub from: Option<PathBuf>,
     pub rules: Option<PathBuf>,
     pub color: theme::ColorMode,
+    /// Also descend into other mounted filesystems.
+    pub cross_mounts: bool,
 }
 
 pub fn run(opts: Options) -> Result<()> {
@@ -36,17 +38,19 @@ pub fn run(opts: Options) -> Result<()> {
 fn run_inner(terminal: &mut DefaultTerminal, opts: &Options) -> Result<()> {
     let mut snap = match &opts.from {
         Some(file) => crate::load_snapshot(file)?,
-        None => match scan_with_progress(terminal, &opts.root)? {
+        None => match scan_with_progress(terminal, &opts.root, opts.cross_mounts)? {
             Some(s) => s,
             None => return Ok(()),
         },
     };
+    let mut from_saved = opts.from.is_some();
     loop {
         let rules = crate::load_rules(snap.platform(), opts.rules.as_deref())?;
         let findings = diskwise_core::analyze(&snap, &rules, crate::now());
         let mut app = App::new(snap, findings);
-        if opts.from.is_some() {
+        if from_saved {
             app.status = Some("Showing a saved snapshot. Press r to rescan.".into());
+            from_saved = false;
         }
 
         while !app.quit && !app.rescan_requested {
@@ -61,7 +65,7 @@ fn run_inner(terminal: &mut DefaultTerminal, opts: &Options) -> Result<()> {
             return Ok(());
         }
         let root = PathBuf::from(&app.snap.root);
-        snap = match scan_with_progress(terminal, &root)? {
+        snap = match scan_with_progress(terminal, &root, opts.cross_mounts)? {
             Some(s) => s,
             None => return Ok(()),
         };
@@ -69,10 +73,15 @@ fn run_inner(terminal: &mut DefaultTerminal, opts: &Options) -> Result<()> {
 }
 
 /// Scan in a background thread while drawing live counts. None if the user quit.
-fn scan_with_progress(terminal: &mut DefaultTerminal, root: &Path) -> Result<Option<Snapshot>> {
+fn scan_with_progress(
+    terminal: &mut DefaultTerminal,
+    root: &Path,
+    cross_mounts: bool,
+) -> Result<Option<Snapshot>> {
     let progress = Arc::new(ScanProgress::default());
     let opts = ScanOptions {
         progress: Some(progress.clone()),
+        one_filesystem: !cross_mounts,
         ..Default::default()
     };
     let root_owned = root.to_path_buf();

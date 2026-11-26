@@ -32,18 +32,14 @@ fn skipped_mounts_finding(snap: &Snapshot) -> Option<Finding> {
         .iter()
         .map(|m| p.display_path(m))
         .collect();
-    let mounts = snap
-        .system
-        .as_ref()
-        .map(|s| s.mounts.as_slice())
-        .unwrap_or_default();
+    // A mount's usage is only its own if no other mount shares the device (btrfs
+    // subvolumes such as / and /home report the same filesystem's totals).
     let used: Vec<Option<u64>> = paths
         .iter()
         .map(|path| {
-            mounts
-                .iter()
-                .find(|m| &m.mount_point == path)
-                .map(|m| m.capacity.saturating_sub(m.free))
+            let sys = snap.system.as_ref()?;
+            let m = sys.mounts.iter().find(|m| &m.mount_point == path)?;
+            (!sys.shares_device(m)).then(|| m.capacity.saturating_sub(m.free))
         })
         .collect();
     let size_known = used.iter().all(Option::is_some);
@@ -143,7 +139,9 @@ fn join(dir: &str, name: &str) -> String {
 
 fn walk(node: &Node, path: &str, rules: &RuleSet, now: i64, out: &mut HashMap<usize, Finding>) {
     for child in &node.children {
-        if child.kind == NodeKind::Rest {
+        // Links are never claimed by rules: they take almost no space, and moving
+        // one to the Trash wouldn't free what it points to.
+        if matches!(child.kind, NodeKind::Rest | NodeKind::Link) {
             continue;
         }
         let child_path = join(path, &child.name);
@@ -205,7 +203,7 @@ fn system_findings(snap: &Snapshot) -> Vec<Finding> {
     }
     let Some(sys) = &snap.system else { return out };
 
-    for m in &sys.mounts {
+    for m in sys.unique_mounts() {
         let used = m.capacity.saturating_sub(m.free);
         if m.capacity > 0 && used as f64 / m.capacity as f64 >= NEARLY_FULL {
             out.push(info(
@@ -322,11 +320,17 @@ fn system_findings(snap: &Snapshot) -> Vec<Finding> {
         out.push(info(
             "swap",
             "Large swap usage",
-            swap.total,
+            swap.used,
             true,
             format!(
-                "macOS is using {} of swap, memory moved to disk because RAM is full.",
-                human_bytes(swap.used)
+                "{} is using {} of swap ({} allocated): memory moved to disk because RAM is full.",
+                if snap.platform().os == "macos" {
+                    "macOS"
+                } else {
+                    "The system"
+                },
+                human_bytes(swap.used),
+                human_bytes(swap.total)
             ),
             "Quit memory-heavy apps or restart to release it.",
         ));
@@ -435,6 +439,69 @@ mod tests {
                 .iter()
                 .any(|f| f.id == "preboot-large" || f.id == "unscanned-space")
         );
+    }
+
+    #[test]
+    fn btrfs_home_is_reported_without_a_misleading_size() {
+        use crate::system::MountInfo;
+        let mut snap = snapshot(dir("/", vec![]), 0);
+        snap.os = "linux".into();
+        snap.root = "/".into();
+        snap.skipped_mounts = vec!["/home".into()];
+        let sys = snap.system.as_mut().unwrap();
+        sys.container = None;
+        let m = |mp: &str| MountInfo {
+            mount_point: mp.into(),
+            device: "/dev/sda2".into(),
+            fs_type: "btrfs".into(),
+            capacity: 100 * GB,
+            free: 50 * GB,
+        };
+        sys.mounts = vec![m("/"), m("/home")];
+        let findings = analyze(&snap, &RuleSet::builtin_for(&platform::LINUX).unwrap(), NOW);
+        let skipped = findings.iter().find(|f| f.id == "skipped-mounts").unwrap();
+        assert_eq!(skipped.items[0].path, "/home");
+        assert!(
+            !skipped.size_known,
+            "shared device: / and /home report the same totals"
+        );
+    }
+
+    #[test]
+    fn swap_finding_reports_used_space() {
+        let mut snap = snapshot(dir("/", vec![]), 0);
+        snap.os = "linux".into();
+        snap.system.as_mut().unwrap().swap = Some(crate::system::SwapInfo {
+            total: 16 * GB,
+            used: 5 * GB,
+        });
+        let findings = analyze(&snap, &RuleSet::builtin_for(&platform::LINUX).unwrap(), NOW);
+        let swap = findings.iter().find(|f| f.id == "swap").unwrap();
+        assert_eq!(swap.bytes, 5 * GB);
+        assert!(swap.why.starts_with("The system is using"), "{}", swap.why);
+    }
+
+    #[test]
+    fn links_are_never_claimed() {
+        let mut link = Node::new("Google".into(), NodeKind::Link);
+        link.allocated = 5 * GB; // even if it somehow looked big
+        link.target = Some("/elsewhere".into());
+        let tree = dir(
+            platform::MACOS.default_root,
+            vec![dir(
+                "Users",
+                vec![dir(
+                    "v",
+                    vec![dir("Library", vec![dir("Caches", vec![link])])],
+                )],
+            )],
+        );
+        let findings = analyze(
+            &snapshot(tree, 0),
+            &RuleSet::builtin_for(&platform::MACOS).unwrap(),
+            NOW,
+        );
+        assert!(findings.iter().all(|f| f.id != "user-caches"));
     }
 
     #[test]

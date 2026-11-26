@@ -244,11 +244,22 @@ fn draw_browser(f: &mut Frame, app: &App, area: Rect) {
         .map(|(i, e)| {
             let frac = e.allocated as f64 / total as f64;
             let name = match e.kind {
-                NodeKind::Dir => Span::styled(format!("{}/", e.name), Style::new().bold()),
-                NodeKind::File => Span::raw(e.name.clone()),
-                NodeKind::Rest => {
-                    Span::styled(format!("({} smaller items)", e.files + e.dirs), muted())
+                NodeKind::Dir => {
+                    Line::from(Span::styled(format!("{}/", e.name), Style::new().bold()))
                 }
+                NodeKind::File => Line::from(e.name.clone()),
+                NodeKind::Rest => Line::from(Span::styled(
+                    format!("({} smaller items)", e.files + e.dirs),
+                    muted(),
+                )),
+                // Links: italic and muted, with where they point.
+                NodeKind::Link => Line::from(vec![
+                    Span::styled(e.name.clone(), muted().italic()),
+                    Span::styled(
+                        format!(" → {}", e.target.as_deref().unwrap_or("?")),
+                        muted().italic(),
+                    ),
+                ]),
             };
             let tag = app
                 .entry_path(e)
@@ -358,6 +369,23 @@ fn draw_entry_details(f: &mut Frame, app: &App, area: Rect) {
                 facts.push_str(" · partly unreadable");
             }
             lines.push(Line::from(Span::styled(path.clone(), Style::new().bold())));
+            if e.kind == NodeKind::Link {
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "Link to {}",
+                        e.target.as_deref().unwrap_or("an unknown target")
+                    ),
+                    muted().italic(),
+                )));
+                lines.push(Line::from(
+                    "What it points to is stored (and counted) there, not here. ⏎ follows the link.",
+                ));
+                f.render_widget(
+                    Paragraph::new(lines).wrap(Wrap { trim: true }).block(block),
+                    area,
+                );
+                return;
+            }
             lines.push(Line::from(Span::styled(facts, muted())));
             match app.coverage(&path) {
                 Some(c) if c.direct => lines.extend(finding_lines(c.finding)),
@@ -615,11 +643,15 @@ fn draw_modal(f: &mut Frame, modal: &Modal) {
             )
         }
     };
-    // Border plus a little room for lines that wrap at this width.
-    let area = centered(f.area(), 90, text.height() as u16 + 3);
+    // Size the dialog to its wrapped text, so the last line (often the y/n
+    // prompt) is never cut off.
+    let width = 90.min(f.area().width);
+    let body = Paragraph::new(text).wrap(Wrap { trim: false });
+    let height = body.line_count(width.saturating_sub(2)) as u16 + 2;
+    let area = centered(f.area(), width, height);
     f.render_widget(Clear, area);
     f.render_widget(
-        Paragraph::new(text).wrap(Wrap { trim: false }).block(
+        body.block(
             Block::bordered()
                 .border_type(BorderType::Rounded)
                 .border_style(Style::new().fg(border))
@@ -745,6 +777,24 @@ mod tests {
         app.open();
         app.request_trash();
         show("confirm", &app);
+    }
+
+    #[test]
+    fn dialog_never_cuts_off_the_prompt() {
+        let mut app = super::super::app::sample_app("/r");
+        let long = format!("/r/{}", "very-long-folder-name/".repeat(8));
+        app.modal = Some(Modal::ConfirmTrash {
+            targets: vec![super::super::app::TrashTarget {
+                path: long,
+                bytes: 1,
+            }],
+            warning: Some("A long caution that wraps. ".repeat(10)),
+        });
+        let screen = render(&app, 100, 40);
+        assert!(
+            screen.contains("move to Trash") && screen.contains("cancel"),
+            "{screen}"
+        );
     }
 
     #[test]

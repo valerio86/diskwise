@@ -17,9 +17,13 @@ pub struct SystemInfo {
     /// macOS: the APFS container and its volumes (they share free space).
     #[serde(default)]
     pub container: Option<ContainerInfo>,
-    /// Linux: mounted storage filesystems, most used first.
+    /// Linux: mounted storage filesystems, most used first. A device can appear
+    /// more than once (btrfs subvolumes, bind mounts); see `unique_mounts`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mounts: Vec<MountInfo>,
+    /// Linux: mount points of kernel and in-memory filesystems (proc, tmpfs, …).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub virtual_mounts: Vec<String>,
     /// macOS: local APFS snapshots (Time Machine, OS updates); size not reported.
     #[serde(default)]
     pub snapshots: Vec<String>,
@@ -66,6 +70,26 @@ pub struct MountInfo {
 pub struct SwapInfo {
     pub total: u64,
     pub used: u64,
+}
+
+impl SystemInfo {
+    /// Storage mounts with each device listed once (for usage displays).
+    pub fn unique_mounts(&self) -> Vec<&MountInfo> {
+        let mut seen = std::collections::HashSet::new();
+        self.mounts
+            .iter()
+            .filter(|m| seen.insert(&m.device))
+            .collect()
+    }
+
+    /// Whether another mount shares this one's device, so its usage isn't its own.
+    pub fn shares_device(&self, mount: &MountInfo) -> bool {
+        self.mounts
+            .iter()
+            .filter(|m| m.device == mount.device)
+            .count()
+            > 1
+    }
 }
 
 /// Collect system storage info relevant to a scan of `path`.

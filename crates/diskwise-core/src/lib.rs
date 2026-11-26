@@ -23,6 +23,9 @@ pub const DEFAULT_ROOT: &str = platform::CURRENT.default_root;
 
 /// Run a full scan and, optionally, the system probes.
 pub fn snapshot(root: &Path, opts: ScanOptions, with_system: bool) -> std::io::Result<Snapshot> {
+    // Rules match absolute paths, and paths are compared as strings throughout,
+    // so resolve "." / "Downloads/" / symlinked roots to one canonical form.
+    let root = &std::fs::canonicalize(root)?;
     let started = Instant::now();
     let min_node_size = opts.min_node_size;
     let scan::ScanOutput {
@@ -31,11 +34,11 @@ pub fn snapshot(root: &Path, opts: ScanOptions, with_system: bool) -> std::io::R
         skipped_mounts,
     } = scan::scan(root, opts)?;
     let system = with_system.then(|| system::probe(&root.display().to_string()));
-    // Where the probe lists the real storage filesystems (Linux), in-memory ones
-    // like /dev and /run don't count as "not scanned".
+    // Kernel and in-memory filesystems (/proc, /dev, /run, …) don't count as "not
+    // scanned". Everything else does, including network and FUSE mounts.
     let mut skipped_mounts = skipped_mounts;
-    if let Some(sys) = system.as_ref().filter(|s| !s.mounts.is_empty()) {
-        skipped_mounts.retain(|m| sys.mounts.iter().any(|mi| &mi.mount_point == m));
+    if let Some(sys) = &system {
+        skipped_mounts.retain(|m| !sys.virtual_mounts.contains(m));
     }
     Ok(Snapshot {
         version: model::SNAPSHOT_VERSION,
@@ -88,6 +91,15 @@ pub fn parse_size(s: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_root_is_canonical() {
+        // "." must become an absolute path, or no rule (all absolute) can match.
+        let snap = snapshot(Path::new("."), ScanOptions::default(), false).unwrap();
+        assert!(snap.root.starts_with('/'));
+        assert_eq!(Path::new(&snap.root), std::fs::canonicalize(".").unwrap());
+        assert!(!snap.root.ends_with("/.") && !snap.root.ends_with("/"));
+    }
 
     #[test]
     fn sizes() {

@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Version of the JSON snapshot format. Bump when the shape changes.
-pub const SNAPSHOT_VERSION: u32 = 2;
+pub const SNAPSHOT_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -10,6 +10,9 @@ pub enum NodeKind {
     File,
     /// Aggregate of children too small to list individually.
     Rest,
+    /// A symbolic link (not followed). Its own size is tiny; what it points to
+    /// is counted where it lives, if inside the scan.
+    Link,
 }
 
 /// One entry in the size tree. Directory sizes include everything beneath them.
@@ -32,6 +35,9 @@ pub struct Node {
     pub incomplete: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub children: Vec<Node>,
+    /// For links: the target as written in the link.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
 }
 
 impl Node {
@@ -46,6 +52,7 @@ impl Node {
             newest_mtime: 0,
             incomplete: false,
             children: Vec::new(),
+            target: None,
         }
     }
 }

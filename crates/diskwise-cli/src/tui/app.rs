@@ -91,7 +91,12 @@ pub struct App {
 impl App {
     pub fn new(snap: Snapshot, findings: Vec<Finding>) -> Self {
         let platform = snap.platform();
-        let root_display = platform.display_path(&snap.root);
+        // No trailing slash (except "/" itself): paths are joined and compared as
+        // strings, and a root typed as "/home/v/" would otherwise match nothing.
+        let mut root_display = platform.display_path(&snap.root);
+        while root_display.len() > 1 && root_display.ends_with('/') {
+            root_display.pop();
+        }
         let mut app = App {
             snap,
             findings,
@@ -175,12 +180,12 @@ impl App {
 
     /// Child-index path to a display path, if it's in the (pruned) tree.
     pub fn locate(&self, path: &str) -> Option<Vec<usize>> {
-        let rel = if self.root_display == "/" {
-            path.strip_prefix('/')?
-        } else {
-            path.strip_prefix(self.root_display.as_str())?
-                .strip_prefix('/')?
-        };
+        let rest = path.strip_prefix(self.root_display.as_str())?;
+        // "/home/v" must not match "/home/vx/…".
+        if !(rest.is_empty() || rest.starts_with('/') || self.root_display.ends_with('/')) {
+            return None;
+        }
+        let rel = rest.trim_start_matches('/');
         let mut idx = Vec::new();
         let mut node = &self.snap.tree;
         for name in rel.split('/').filter(|s| !s.is_empty()) {
@@ -249,8 +254,10 @@ impl App {
                 let Some(node) = self.selected_node() else {
                     return;
                 };
-                match node.kind {
-                    NodeKind::Dir if !node.children.is_empty() => {
+                let (kind, has_children, path) =
+                    (node.kind, !node.children.is_empty(), self.entry_path(node));
+                match kind {
+                    NodeKind::Dir if has_children => {
                         self.cwd.push(self.selected);
                         self.selected = 0;
                         self.status = None;
@@ -260,6 +267,11 @@ impl App {
                             "Nothing inside is over {} on its own.",
                             diskwise_core::human_bytes(self.snap.min_node_size)
                         ))
+                    }
+                    NodeKind::Link => {
+                        if let Some(p) = path {
+                            self.follow_link(&p);
+                        }
                     }
                     _ => {}
                 }
@@ -276,6 +288,26 @@ impl App {
                     return;
                 };
                 self.reveal(&path);
+            }
+        }
+    }
+
+    /// Jump to where a link points, if that was scanned; otherwise say where it goes.
+    fn follow_link(&mut self, link: &str) {
+        match std::fs::canonicalize(self.real_path(link)) {
+            Ok(t) => {
+                let target = self.platform.display_path(&t.display().to_string());
+                if self.locate(&target).is_some() {
+                    self.reveal(&target);
+                    self.status = Some(format!("Followed the link to {target}."));
+                } else {
+                    self.status = Some(format!(
+                        "This links to {target}, outside what's shown here. Its contents are counted there, not in this folder."
+                    ));
+                }
+            }
+            Err(_) => {
+                self.status = Some("This link points to something that no longer exists.".into())
             }
         }
     }
@@ -341,10 +373,21 @@ impl App {
                     path: path.clone(),
                     bytes: node.allocated,
                 };
+                let link_target = (node.kind == NodeKind::Link)
+                    .then(|| node.target.clone().unwrap_or_else(|| "its target".into()));
                 if let Some(reason) = self.protected_reason(&path) {
                     self.modal = Some(Modal::Message {
                         title: "Protected folder".into(),
                         body: reason,
+                    });
+                    return;
+                }
+                if let Some(points_to) = link_target {
+                    self.modal = Some(Modal::ConfirmTrash {
+                        targets: vec![target],
+                        warning: Some(format!(
+                            "This is a link. Only the link is moved to the Trash, not {points_to}, so this frees almost no space."
+                        )),
                     });
                     return;
                 }
@@ -373,19 +416,40 @@ impl App {
                     self.modal = Some(refusal(&f));
                     return;
                 }
-                let targets: Vec<TrashTarget> = f
+                let (allowed, protected): (Vec<_>, Vec<_>) = f
                     .items
                     .iter()
-                    .filter(|i| self.protected_reason(&i.path).is_none())
+                    .partition(|i| self.protected_reason(&i.path).is_none());
+                if allowed.is_empty() {
+                    self.modal = Some(Modal::Message {
+                        title: "Nothing to move".into(),
+                        body: "Every item in this suggestion is a top-level or home folder, which diskwise won't move to the Trash.".into(),
+                    });
+                    return;
+                }
+                let mut warning = warning_for(&f, true);
+                if !protected.is_empty() {
+                    let note = format!(
+                        "Left out (protected folders): {}.",
+                        protected
+                            .iter()
+                            .map(|i| i.path.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                    warning = Some(match warning {
+                        Some(w) => format!("{w} {note}"),
+                        None => note,
+                    });
+                }
+                let targets = allowed
+                    .into_iter()
                     .map(|i| TrashTarget {
                         path: i.path.clone(),
                         bytes: i.bytes,
                     })
                     .collect();
-                self.modal = Some(Modal::ConfirmTrash {
-                    targets,
-                    warning: warning_for(&f, true),
-                });
+                self.modal = Some(Modal::ConfirmTrash { targets, warning });
             }
         }
     }
@@ -430,7 +494,7 @@ impl App {
                 }
                 Ok(()) => {
                     self.remove_from_tree(&t.path);
-                    self.remove_from_findings(&t.path);
+                    self.remove_from_findings(&t.path, t.bytes);
                     moved += t.bytes;
                     moved_count += 1;
                 }
@@ -504,11 +568,18 @@ impl App {
     /// Remove `path` (and anything inside it) from the findings. A finding whose
     /// last item is gone is dropped; findings that never had items (system
     /// explanations) are kept.
-    fn remove_from_findings(&mut self, path: &str) {
+    fn remove_from_findings(&mut self, path: &str, bytes: u64) {
         let inside = |p: &str| p == path || p.starts_with(&format!("{path}/"));
+        // An item that *contains* the removed path (e.g. trashing Chrome/ inside the
+        // Caches/Google item) loses those bytes but stays.
+        let contains = |item: &str| path.starts_with(&format!("{item}/"));
         self.findings.retain_mut(|f| {
             if f.items.is_empty() {
                 return true;
+            }
+            for item in f.items.iter_mut().filter(|i| contains(&i.path)) {
+                item.bytes = item.bytes.saturating_sub(bytes);
+                f.bytes = f.bytes.saturating_sub(bytes);
             }
             let removed: u64 = f
                 .items
@@ -817,6 +888,107 @@ mod tests {
         assert_eq!(app.cleanable_below(&format!("{root_s}/home/v")), 0);
         assert_eq!(app.selected_node().unwrap().name, "docs");
         assert!(app.coverage(&docs).is_some());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn root_with_trailing_slash_still_locates() {
+        let mut snap = sample_app("/r").snap;
+        snap.root = "/r/".into();
+        let mut app = App::new(snap, vec![]);
+        assert_eq!(app.root_display, "/r");
+        assert!(app.locate("/r/home/v/cache").is_some());
+        // Path boundaries are respected: "/r" is not a prefix of "/rx".
+        assert!(app.locate("/rx/home").is_none());
+        app.reveal("/r/home/v/docs");
+        assert_eq!(app.selected_node().unwrap().name, "docs");
+    }
+
+    #[test]
+    fn trashing_inside_an_item_shrinks_that_item() {
+        let root = std::env::temp_dir().join(format!("diskwise-inside-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("home/v/cache")).unwrap();
+        std::fs::write(root.join("home/v/cache/a"), b"x").unwrap();
+        let r = root.display().to_string();
+        let mut app = app_at(&r);
+        let inner = format!("{r}/home/v/cache/a");
+        app.apply_trash(
+            &[TrashTarget {
+                path: inner,
+                bytes: 300,
+            }],
+            |p| std::fs::remove_file(p).map_err(|e| e.to_string()),
+        );
+        let cache = app.findings.iter().find(|f| f.id == "cache").unwrap();
+        assert_eq!(cache.bytes, 100, "400 - 300 trashed from inside it");
+        assert_eq!(cache.items[0].bytes, 100);
+        assert_eq!(app.cleanable_below(&format!("{r}/home/v")), 100);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn trash_all_explains_protected_items() {
+        let mut app = app_at("/r");
+        // A finding whose only item is a protected top-level folder.
+        app.findings = vec![finding_for_test("top", "/usr")];
+        app.reindex();
+        app.tab = Tab::Suggestions;
+        app.request_trash();
+        assert!(
+            matches!(app.modal.take(), Some(Modal::Message { .. })),
+            "no empty dialog"
+        );
+        // Mixed: the protected one is named in the warning.
+        app.findings = vec![
+            finding_for_test("mixed", "/usr"),
+            finding_for_test("x", "/r/home/v/cache"),
+        ];
+        let extra = app.findings[1].items[0].clone();
+        app.findings[0].items.push(extra);
+        app.reindex();
+        app.suggestion = app.findings.iter().position(|f| f.id == "mixed").unwrap();
+        app.request_trash();
+        match app.modal.take() {
+            Some(Modal::ConfirmTrash { targets, warning }) => {
+                assert_eq!(targets.len(), 1);
+                assert!(warning.unwrap().contains("/usr"));
+            }
+            other => panic!("expected a confirmation, got {other:?}"),
+        }
+    }
+
+    fn finding_for_test(id: &str, path: &str) -> Finding {
+        let mut f = sample_app("/r").findings.remove(0);
+        f.id = id.into();
+        f.items[0].path = path.into();
+        f
+    }
+
+    #[test]
+    fn links_warn_and_follow() {
+        let root = std::env::temp_dir().join(format!("diskwise-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("home/v/docs")).unwrap();
+        std::os::unix::fs::symlink(root.join("home/v/docs"), root.join("home/v/shortcut")).unwrap();
+        // Canonical form, as the scanner records roots (macOS temp dirs are symlinks).
+        let r = std::fs::canonicalize(&root).unwrap().display().to_string();
+        let mut app = app_at(&r);
+        let mut link = Node::new("shortcut".into(), NodeKind::Link);
+        link.target = Some(format!("{r}/home/v/docs"));
+        let v = app.locate(&format!("{r}/home/v")).unwrap();
+        app.node_at_mut(&v).children.push(link);
+
+        app.reveal(&format!("{r}/home/v/shortcut"));
+        app.request_trash();
+        match app.modal.take() {
+            Some(Modal::ConfirmTrash { warning, .. }) => {
+                assert!(warning.unwrap().contains("Only the link"))
+            }
+            other => panic!("expected a confirmation, got {other:?}"),
+        }
+        app.open();
+        assert_eq!(app.selected_node().unwrap().name, "docs");
         std::fs::remove_dir_all(&root).unwrap();
     }
 

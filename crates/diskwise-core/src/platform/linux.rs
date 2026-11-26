@@ -1,7 +1,6 @@
 //! Linux probes: mounted filesystems (/proc/self/mounts + statvfs), swap
 //! (/proc/meminfo), and download sources (user.xdg.origin.url).
 
-use std::collections::HashSet;
 use std::path::Path;
 
 use crate::system::{MountInfo, SystemInfo, fs_usage};
@@ -12,10 +11,12 @@ const ORIGIN_ATTRS: [&str; 2] = ["user.xdg.origin.url", "user.xdg.referrer.url"]
 pub(crate) fn probe(_path: &str, info: &mut SystemInfo) {
     match std::fs::read_to_string("/proc/self/mounts") {
         Ok(text) => {
-            let mut seen_devices = HashSet::new();
             for (device, mount_point, fs_type) in super::parse_mounts(&text) {
-                // btrfs subvolumes and bind mounts show one device several times.
-                if !super::is_storage_fs(&fs_type) || !seen_devices.insert(device.clone()) {
+                if super::is_virtual_fs(&fs_type) {
+                    info.virtual_mounts.push(mount_point);
+                    continue;
+                }
+                if !super::is_storage_fs(&fs_type) {
                     continue;
                 }
                 match fs_usage(Path::new(&mount_point)) {

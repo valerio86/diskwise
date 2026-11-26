@@ -84,7 +84,9 @@ impl Ctx {
 
 /// Scan `root` into a size tree, noting unreadable paths and skipped mount points.
 pub fn scan(root: &Path, opts: ScanOptions) -> std::io::Result<ScanOutput> {
-    let meta = fs::symlink_metadata(root)?;
+    // Follow the root if it's a link: `read_dir` does, so the device to stay on is
+    // the target's, not the link's.
+    let meta = fs::metadata(root)?;
     let ctx = Ctx {
         opts,
         root_dev: meta.dev(),
@@ -163,7 +165,22 @@ fn scan_dir(path: &Path, name: String, meta: &Metadata, ctx: &Ctx) -> Node {
             continue;
         }
 
-        // Regular files, symlinks (not followed), sockets, etc.
+        // Symlinks are never followed. Links to folders are always listed, so it's
+        // visible that their contents are counted somewhere else.
+        if child_meta.file_type().is_symlink() {
+            let mut link = Node::new(child_name, NodeKind::Link);
+            link.allocated = child_meta.blocks() * 512;
+            link.files = 1;
+            link.newest_mtime = child_meta.mtime();
+            link.target = fs::read_link(&child_path)
+                .ok()
+                .map(|t| t.display().to_string());
+            let to_dir = fs::metadata(&child_path).is_ok_and(|m| m.is_dir());
+            place(&mut node, &mut rest, link, if to_dir { 0 } else { min });
+            continue;
+        }
+
+        // Regular files, sockets, etc.
         let mut file = Node::new(child_name, NodeKind::File);
         file.allocated = ctx.allocated_once(&child_meta);
         file.logical = if child_meta.is_file() {
@@ -264,6 +281,57 @@ mod tests {
             .find(|c| c.kind == NodeKind::Rest)
             .unwrap();
         assert_eq!(rest.files, 1);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn links_to_folders_are_listed_and_not_followed() {
+        let dir = tmpdir("symlinks");
+        fs::create_dir(dir.join("real")).unwrap();
+        write(&dir.join("real/big.bin"), 2 * 1024 * 1024);
+        std::os::unix::fs::symlink(dir.join("real"), dir.join("shortcut")).unwrap();
+        std::os::unix::fs::symlink("big.bin", dir.join("real/file-link")).unwrap();
+
+        let opts = ScanOptions {
+            min_node_size: 1024 * 1024,
+            ..Default::default()
+        };
+        let tree = scan(&dir, opts).unwrap().tree;
+        let link = tree
+            .children
+            .iter()
+            .find(|c| c.name == "shortcut")
+            .expect("dir link listed");
+        assert_eq!(link.kind, NodeKind::Link);
+        assert_eq!(
+            link.target.as_deref(),
+            Some(dir.join("real").to_str().unwrap())
+        );
+        assert!(link.children.is_empty(), "not followed");
+        // Counted once (via real/), not again through the link.
+        assert!(tree.allocated < 3 * 1024 * 1024);
+        // A tiny link to a file is folded like any small file.
+        let real = tree.children.iter().find(|c| c.name == "real").unwrap();
+        assert!(real.children.iter().all(|c| c.name != "file-link"));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn symlinked_root_is_followed() {
+        let dir = tmpdir("linkroot");
+        fs::create_dir_all(dir.join("target/sub")).unwrap();
+        write(&dir.join("target/sub/f"), 2 * 1024 * 1024);
+        std::os::unix::fs::symlink(dir.join("target"), dir.join("root-link")).unwrap();
+        let out = scan(
+            &dir.join("root-link"),
+            ScanOptions {
+                min_node_size: 0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(out.skipped_mounts.is_empty());
+        assert_eq!(out.tree.children[0].name, "sub");
         fs::remove_dir_all(&dir).unwrap();
     }
 

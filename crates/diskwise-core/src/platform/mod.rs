@@ -171,7 +171,43 @@ pub(crate) fn parse_mounts(s: &str) -> Vec<(String, String, String)> {
         .collect()
 }
 
-/// Filesystem types that hold real data (as opposed to proc, tmpfs, cgroup, …).
+/// Kernel, in-memory and image filesystems: never "data the scan missed". Overlay
+/// and squashfs are here because their data is already counted where it's stored
+/// (/var/lib/docker, /var/lib/snapd/snaps).
+#[cfg_attr(target_os = "macos", allow(dead_code))] // used on Linux; tested everywhere
+pub(crate) fn is_virtual_fs(fs_type: &str) -> bool {
+    matches!(
+        fs_type,
+        "proc"
+            | "sysfs"
+            | "tmpfs"
+            | "devtmpfs"
+            | "devpts"
+            | "cgroup"
+            | "cgroup2"
+            | "securityfs"
+            | "pstore"
+            | "efivarfs"
+            | "bpf"
+            | "tracefs"
+            | "debugfs"
+            | "configfs"
+            | "fusectl"
+            | "mqueue"
+            | "hugetlbfs"
+            | "autofs"
+            | "binfmt_misc"
+            | "ramfs"
+            | "nsfs"
+            | "rpc_pipefs"
+            | "squashfs"
+            | "overlay"
+            | "nfsd"
+            | "selinuxfs"
+    )
+}
+
+/// Filesystem types listed with their usage (as opposed to proc, tmpfs, cgroup, …).
 #[cfg_attr(target_os = "macos", allow(dead_code))] // used on Linux; tested everywhere
 pub(crate) fn is_storage_fs(fs_type: &str) -> bool {
     matches!(
@@ -252,5 +288,8 @@ mod tests {
         assert_eq!(m[0], ("/dev/sda1".into(), "/".into(), "ext4".into()));
         assert_eq!(m[2].1, "/mnt/my share");
         assert!(is_storage_fs("cifs") && !is_storage_fs("proc"));
+        assert!(is_virtual_fs("tmpfs") && is_virtual_fs("overlay"));
+        // Unknown types (sshfs, rclone, virtiofs…) are not virtual: still reported.
+        assert!(!is_virtual_fs("fuse.sshfs") && !is_virtual_fs("btrfs"));
     }
 }

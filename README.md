@@ -38,7 +38,7 @@ works locally or over SSH:
 - **Suggestions** (opens here; `1`): the `suggest` list; Enter jumps to the item in the
   browser.
 - **Browse** (Tab or `2`): folders by size with bars. Items a suggestion covers are tagged
-  and colour-coded (green safe, yellow caution, cyan review); folders show how
+  and colour-coded (green safe, yellow caution, pink review); folders show how
   much is cleanable inside them. The details pane says what an item is and how
   to clear it.
 - **Move to Trash** (`d`): always asks first, showing the exact paths, total,
@@ -48,6 +48,10 @@ works locally or over SSH:
   each path is really gone before updating the tree. Space comes back when the
   Trash is emptied. On macOS it uses NSFileManager (no Finder permission prompt,
   works over SSH), so Finder's "Put Back" isn't offered; drag items back instead.
+- **Links** to folders are always listed, in italics as `name → target`: what
+  they point to is counted where it lives. ⏎ follows a link when its target was
+  scanned. Moving a link to the Trash moves only the link (the dialog says so),
+  and rules never match links.
 - `s` sorts by size, name or oldest first; `r` rescans; `?` lists all keys.
 - **Colours** follow what the terminal supports: exact colours where
   `COLORTERM=truecolor`, the 256-colour palette for `*-256color` terminals (and

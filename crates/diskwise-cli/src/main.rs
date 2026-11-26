@@ -68,6 +68,9 @@ enum Command {
         /// Print findings as JSON.
         #[arg(long)]
         json: bool,
+        /// Also descend into other mounted filesystems.
+        #[arg(long)]
+        cross_mounts: bool,
     },
     /// Browse the disk interactively and act on suggestions.
     Tui {
@@ -83,6 +86,9 @@ enum Command {
         /// Colours: detected from the terminal by default (NO_COLOR is honoured).
         #[arg(long, value_enum, default_value = "auto")]
         color: tui::theme::ColorMode,
+        /// Also descend into other mounted filesystems.
+        #[arg(long)]
+        cross_mounts: bool,
     },
     /// List the rules in effect.
     Rules {
@@ -144,12 +150,17 @@ fn main() -> Result<()> {
             items,
             compact,
             json,
+            cross_mounts,
         } => {
             let snap = match from {
                 Some(file) => load_snapshot(&file)?,
                 None => {
                     eprintln!("Scanning {} …", path.display());
-                    diskwise_core::snapshot(&path, ScanOptions::default(), true)
+                    let opts = ScanOptions {
+                        one_filesystem: !cross_mounts,
+                        ..Default::default()
+                    };
+                    diskwise_core::snapshot(&path, opts, true)
                         .with_context(|| format!("scanning {}", path.display()))?
                 }
             };
@@ -170,12 +181,14 @@ fn main() -> Result<()> {
             from,
             rules,
             color,
+            cross_mounts,
         } => {
             tui::run(tui::Options {
                 root: path,
                 from,
                 rules,
                 color,
+                cross_mounts,
             })?;
         }
         Command::Rules { rules, os } => {
@@ -395,7 +408,7 @@ fn print_report(snap: &Snapshot, view: &ViewArgs) {
         }
         if !sys.mounts.is_empty() {
             println!("\nMounted filesystems:");
-            for m in &sys.mounts {
+            for m in sys.unique_mounts() {
                 let used = m.capacity.saturating_sub(m.free);
                 println!(
                     "  {:>10} used of {:>10} ({:>3.0}%)  {} [{}]",
@@ -499,9 +512,10 @@ fn print_tree(node: &Node, level: usize, view: &ViewArgs, total: u64) {
         } else {
             0.0
         };
-        let marker = match child.kind {
-            NodeKind::Dir => "/",
-            _ => "",
+        let marker = match (child.kind, &child.target) {
+            (NodeKind::Dir, _) => "/".to_string(),
+            (NodeKind::Link, Some(t)) => format!(" → {t}"),
+            _ => String::new(),
         };
         let note = if child.incomplete {
             "  (partly unreadable)"
